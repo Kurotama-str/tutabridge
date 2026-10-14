@@ -1,0 +1,8 @@
+{
+  "version": "0.1.0-rc.14",
+  "tag": "tutanota-release-361.261006.0",
+  "upstream": "bbc38dbec458eb36379d499a3d1de9932a6be9e9",
+  "generated": "3408df1853d274efc719c74cef80d4e013ad49cc",
+  "base": "e937f94964250b44cbb4ea668cde507109779c38",
+  "lock": "b3e0fa263a6046b6b77a2e31d903811a251d78aab3bf349b8968ad79bc765f4b"
+}
