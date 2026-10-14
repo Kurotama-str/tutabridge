@@ -123,7 +123,8 @@ def sign(args):
     (directory / 'latest.json').write_text(json.dumps(data, indent=2) + '\n')
     checksums = []
     for p in sorted(directory.iterdir()):
-        checksums.append(f'{hashlib.file_digest(p.open("rb"), "sha256").hexdigest()}  {p.name}')
+        with p.open("rb") as stream:
+            checksums.append(f'{hashlib.file_digest(stream, "sha256").hexdigest()}  {p.name}')
     (directory / 'SHA256SUMS').write_text('\n'.join(checksums) + '\n')
 
 
@@ -181,7 +182,7 @@ def publish(args):
         api('git/refs', 'POST', {'ref': f'refs/tags/{tag}', 'sha': args.source})
     if not existing:
         existing = api('releases', 'POST', dict(tag_name=tag, target_commitish=args.source,
-            name=f'TutaBridge {args.version}', body=f'Built and tested from `{args.source}`. Includes the patched official Tuta SDK pinned in this commit.', draft=True, prerelease=False))
+            name=f'TutaBridge {args.version}', body=f'Built and tested from `{args.source}`. Includes the patched official Tuta SDK pinned in this commit.', draft=True, prerelease=False, generate_release_notes=True))
     run('gh', 'release', 'upload', tag, *[str(p) for p in sorted(directory.iterdir())], '--clobber', '--repo', REPO)
     uploaded = api(f"releases/{existing['id']}")
     names = {p.name: p.stat().st_size for p in directory.iterdir()}

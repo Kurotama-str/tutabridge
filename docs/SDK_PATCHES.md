@@ -71,6 +71,7 @@ first, internal ones last; which is which, and their status, is tracked in
 | 09 owner session key | `decrypt_parsed` with a session key from the owning instance | Blob elements and draft details have no key of their own. |
 | 10 AEAD session reads | Decrypts AEAD v3 values with the session key and field context | Hooks the existing primitives into the entity decoder. |
 | 11 AEAD group reads | Decrypts AEAD v2 values with versioned group keys and the KDF nonce | Key resolution belongs with the key loader. |
+| 12 bucket instance keys | Retains keys for attachment children from their parent Mail | Decapsulation and key context remain in the SDK. |
 
 What the fork used to carry beyond this (event bus client, folder tree,
 MOVE, `MailSetEntry` id codec, inline event decryption) composes from the
@@ -93,7 +94,9 @@ release is a new tag in `sdk/BASE`, a regeneration and a test run.
 
 Every other Monday at 06:00 UTC (anchor: 2026-10-19), `sdk-bump.yml`
 selects the latest official Tuta release tag. The weekly cron exits on the
-alternate week before querying Tuta. A manual run bypasses the date guard.
+alternate week before querying Tuta. An unfinished release is resumed on
+the next weekly wake-up; the fortnightly gate applies only to new bumps.
+A manual run bypasses the date guard.
 The GUI checks for published updates every six hours; this is a separate clock.
 
 The workflow tests every patch in a job without publication credentials,
@@ -126,5 +129,8 @@ Validation modes: SDK bump with `dry_run=true` only regenerates/tests the SDK,
 without any push, PR or release. A manual Release run builds all platforms and
 signs with an ephemeral test key, publishing workflow artifacts only. Those
 preview signatures are intentionally not trusted by production apps.
-For a rollback, the reusable Release workflow accepts an older main commit
-with a new higher rc version; installed apps never downgrade their version.
+For a bridge-only fix or rollback, dispatch Release with `publish=true`, an
+explicit main commit and a new higher rc version. This path runs full CI too.
+Retry with the same version/source to resume an unpublished draft. Installed
+apps never downgrade their version. Editing a committed release plan by hand
+invalidates its provenance and stops automation until the plan is repaired.

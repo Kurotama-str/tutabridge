@@ -63,11 +63,12 @@ jobs:
     env:
       TAG: ${{ needs.detect.outputs.tag }}
       COMMIT: ${{ needs.detect.outputs.upstream }}
+      BASE: ${{ needs.detect.outputs.base }}
     steps:
       - name: Clone this repository and the vendored SDK
         run: |
           git clone --quiet "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" .
-          git checkout --quiet "${{ needs.detect.outputs.base }}"
+          git checkout --quiet "$BASE"
           git submodule update --init --quiet tuta-repo
 
       # Same as the CI's Linux job: the SDK tests build the rustls stack.
@@ -151,6 +152,8 @@ jobs:
           GENERATED: ${{ needs.verify.outputs.generated }}
         run: python3 scripts/sdk-release.py candidate
 
+  # The candidate PR also runs ordinary PR CI; this explicit call is the
+  # integration gate and never depends on token-triggered workflow events.
   bridge-ci:
     needs: [detect, candidate]
     if: always() && !cancelled() && (needs.detect.outputs.mode == 'resume' || needs.candidate.outputs.ready == 'true')

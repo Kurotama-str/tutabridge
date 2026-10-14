@@ -157,18 +157,52 @@ class GitCandidate(unittest.TestCase):
     def test_pending_plan_resumes_exact_source_even_after_main_moves(self):
         Path('notes.txt').write_text('main progressed')
         sdk.git('add', 'notes.txt'); sdk.git('commit', '-qm', 'later')
-        args = type('Args', (), dict(scheduled=False, dry_run=False, tag=''))()
-        with patch.object(sdk, 'release_list', return_value=[]), patch.object(sdk, 'outputs') as out:
+        args = type('Args', (), dict(scheduled=True, dry_run=False, tag=''))()
+        with patch.object(sdk, 'scheduled_today', return_value=False), patch.object(sdk, 'release_list', return_value=[]), patch.object(sdk, 'outputs') as out:
             sdk.detect(args)
         self.assertEqual(out.call_args.kwargs['source'], self.source)
         self.assertEqual(out.call_args.kwargs['mode'], 'resume')
 
-    def test_off_week_does_no_network_work(self):
+    def test_off_week_does_not_select_a_new_sdk(self):
         args = type('Args', (), dict(scheduled=True, dry_run=False, tag=''))()
-        with patch.object(sdk, 'scheduled_today', return_value=False), patch.object(sdk, 'release_list') as releases, patch.object(sdk, 'outputs') as out:
+        sdk.git('checkout', '--detach', self.base)
+        with patch.object(sdk, 'scheduled_today', return_value=False), patch.object(sdk, 'release_list', return_value=[]), patch.object(sdk, 'outputs') as out:
             sdk.detect(args)
-            releases.assert_not_called()
             out.assert_called_once_with(mode='skip')
+
+
+    def test_latest_no_change_dry_run_and_downgrade(self):
+        sdk.git('checkout', '--detach', self.base)
+        sdk.git('tag', 'v0.1.0-rc.13')
+        real_git = sdk.git
+        refs = '\n'.join(['1'*40+'\trefs/tags/tutanota-release-360.260922.0', '2'*40+'\trefs/tags/tutanota-release-361.261006.0', '4'*40+'\trefs/tags/tutanota-release-359.260901.0'])
+        def git(*args):
+            return refs if args[0]=='ls-remote' else real_git(*args)
+        for target,dry,mode in [('',False,'bump'),('tutanota-release-360.260922.0',False,'skip'),('tutanota-release-360.260922.0',True,'bump')]:
+            args = type('Args',(),dict(scheduled=False,dry_run=dry,tag=target))()
+            with patch.object(sdk,'git',side_effect=git),patch.object(sdk,'release_list',return_value=[]),patch.object(sdk,'outputs') as out:
+                sdk.detect(args)
+                self.assertEqual(out.call_args.kwargs['mode'],mode)
+                if not target:
+                    self.assertEqual(out.call_args.kwargs['tag'],'tutanota-release-361.261006.0')
+        args = type('Args',(),dict(scheduled=False,dry_run=False,tag='tutanota-release-359.260901.0'))()
+        with patch.object(sdk,'git',side_effect=git),patch.object(sdk,'release_list',return_value=[]):
+            with self.assertRaisesRegex(ValueError,'downgrade'):
+                sdk.detect(args)
+
+    def test_verification_failure_only_creates_diagnostic(self):
+        sdk.git('checkout', '--detach', self.base)
+        real_git = sdk.git
+        def git(*args):
+            return '' if args[0]=='ls-remote' else real_git(*args)
+        env = dict(BASE=self.base,TAG='tutanota-release-361.261006.0',UPSTREAM_SHA='2'*40,VERIFIED='failure',VERSION='0.1.0-rc.14',GITHUB_RUN_ID='123')
+        with patch.dict(os.environ,env),patch.object(sdk,'git',side_effect=git),patch.object(sdk,'push') as push,patch.object(sdk,'open_pr') as pr,patch.object(sdk,'outputs') as out:
+            sdk.candidate(None)
+            self.assertFalse(out.call_args.kwargs['ready'])
+            self.assertEqual(out.call_args.kwargs['source'],'')
+            self.assertTrue(push.call_args.args[2].endswith('-diagnostic'))
+            self.assertIn('never automatically integrated',pr.call_args.args[2])
+            self.assertEqual(real_git('diff-tree','--no-commit-id','--name-only','-r','HEAD'),'sdk/BASE')
 
 
 class Assets(unittest.TestCase):

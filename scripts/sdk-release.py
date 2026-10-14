@@ -126,9 +126,6 @@ def validate_candidate(sha, expected_base=None, expected_generated=None):
 
 
 def detect(args):
-    if args.scheduled and not scheduled_today(datetime.now(timezone.utc).date()):
-        outputs(mode='skip')
-        return
     base = git('rev-parse', 'HEAD')
     available = release_list()
     if not args.dry_run and 'release-plan.json' in git('ls-tree', '--name-only', base).splitlines():
@@ -141,6 +138,9 @@ def detect(args):
         if not existing or existing['draft']:
             outputs(mode='resume', source=source, version=plan['version'], base=base)
             return
+    if args.scheduled and not scheduled_today(datetime.now(timezone.utc).date()):
+        outputs(mode='skip')
+        return
     current = base_at(base)['tag']
     refs = git('ls-remote', '--tags', UPSTREAM, 'refs/tags/tutanota-release-*').splitlines()
     tags = {line.split()[1].removeprefix('refs/tags/').removesuffix('^{}') for line in refs}

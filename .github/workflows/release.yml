@@ -1,6 +1,8 @@
 name: Release
 
-# Manual runs are previews. Production publication is called explicitly by
+# Manual runs default to previews; publish=true also supports bridge-only
+# releases and a higher-version rollback from an older main SHA.
+# Automated publication is called explicitly by
 # sdk-bump after exact-source CI and integration; token pushes need no chaining.
 on:
   workflow_dispatch:
@@ -12,6 +14,10 @@ on:
         description: "Preview version, X.Y.Z-rc.N"
         default: "0.1.0-rc.0"
         required: true
+      publish:
+        description: "Publish after full CI (explicit version and main source required)"
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       ref:
@@ -53,14 +59,22 @@ jobs:
           SOURCE_REF: ${{ inputs.ref || github.sha }}
           PUBLISH: ${{ inputs.publish }}
         run: |
-          sha=$(git rev-parse --verify "$SOURCE_REF^{commit}")
+          sha=$(git rev-parse --verify --end-of-options "$SOURCE_REF^{commit}")
           if [ "$PUBLISH" = true ]; then
             git merge-base --is-ancestor "$sha" origin/main
           fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
-  build:
+  manual-ci:
     needs: source
+    if: inputs.publish && github.workflow == 'Release'
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.source.outputs.sha }}
+
+  build:
+    needs: [source, manual-ci]
+    if: always() && !cancelled() && needs.source.result == 'success' && (needs.manual-ci.result == 'success' || needs.manual-ci.result == 'skipped')
     strategy:
       fail-fast: false
       matrix:
@@ -78,6 +92,8 @@ jobs:
             tauri_args: ""
             bundle_path: target/release/bundle
     runs-on: ${{ matrix.platform }}
+    permissions:
+      contents: read
     steps:
       - name: Checkout release tooling
         uses: actions/checkout@v4
@@ -92,6 +108,9 @@ jobs:
           submodules: recursive
           fetch-depth: 0
           persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust_targets }}
