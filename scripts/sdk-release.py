@@ -2,19 +2,25 @@
 """Git-only SDK release coordination; upstream code runs in separate CI jobs."""
 import argparse
 import base64
+import gzip
+import hashlib
+import io
 from datetime import date, datetime, timezone
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
+import tomllib
 
 REPO = 'spartanz51/tutabridge'
 UPSTREAM = 'https://github.com/tutao/tutanota.git'
 FORK = 'https://github.com/spartanz51/tutanota.git'
 BOT_NAME = 'github-actions[bot]'
 BOT_EMAIL = '41898282+github-actions[bot]@users.noreply.github.com'
-ALLOWED = {'.gitmodules', 'sdk/BASE', 'tuta-repo', 'release-plan.json'}
+ALLOWED = {'.gitmodules', 'sdk/BASE', 'tuta-repo', 'release-plan.json', 'Cargo.lock'}
+LOCK_ENCODED_LIMIT = 64 * 1024
+LOCK_DIFF_LIMIT = 1024 * 1024
 TAG = re.compile(r'tutanota-release-(\d+)\.(\d{6})\.(\d+)\Z')
 VERSION = re.compile(r'0\.1\.0-rc\.(\d+)\Z')
 SHA = re.compile(r'[0-9a-f]{40}\Z')
@@ -83,6 +89,68 @@ def next_version(tags, drafts):
     return f'0.1.0-rc.{max(numbers) + 1}'
 
 
+def lock_bytes(ref):
+    entry = git('ls-tree', ref, '--', 'Cargo.lock').split()
+    if not entry or entry[0] != '100644':
+        raise ValueError('Cargo.lock must be a regular non-executable file')
+    return subprocess.check_output(['git', 'show', f'{ref}:Cargo.lock'])
+
+
+def validate_lock(before, after):
+    old, new = (tomllib.loads(data.decode('utf-8')) for data in (before, after))
+    if not isinstance(new.get('version'), int) or not isinstance(new.get('package'), list):
+        raise ValueError('Invalid Cargo.lock structure')
+    sources = {p.get('source') for p in old['package']}
+    sources.add('registry+https://github.com/rust-lang/crates.io-index')
+    sources.add(None)
+    if any(p.get('source') not in sources for p in new['package']) or old.get('patch') != new.get('patch'):
+        raise ValueError('New dependency source or patch section requires review')
+    return hashlib.sha256(after).hexdigest()
+
+
+def lock(args):
+    before = lock_bytes('HEAD')
+    run('cargo', 'update', '--workspace')
+    run('cargo', 'metadata', '--locked', '--format-version', '1')
+    digest = validate_lock(before, Path('Cargo.lock').read_bytes())
+    diff = subprocess.check_output(['git', 'diff', '--no-ext-diff', '--no-textconv', '--', 'Cargo.lock'])
+    encoded = base64.b64encode(gzip.compress(diff, mtime=0)).decode('ascii')
+    if len(diff) > LOCK_DIFF_LIMIT or len(encoded) > LOCK_ENCODED_LIMIT:
+        raise ValueError('Cargo.lock diff exceeds workflow transport limits')
+    outputs(lock_diff=encoded, lock_hash=digest)
+
+
+def apply_lock(encoded, expected):
+    if len(encoded) > LOCK_ENCODED_LIMIT or not re.fullmatch('[0-9a-f]{64}', expected):
+        raise ValueError('Invalid lockfile transport size or digest')
+    with gzip.GzipFile(fileobj=io.BytesIO(base64.b64decode(encoded, validate=True))) as compressed:
+        diff = compressed.read(LOCK_DIFF_LIMIT + 1)
+    if len(diff) > LOCK_DIFF_LIMIT:
+        raise ValueError('Cargo.lock diff exceeds decompression limit')
+    if diff:
+        paths = run('git', 'apply', '--numstat', input=diff.decode('utf-8')).splitlines()
+        if len(paths) != 1 or paths[0].split('\t')[2:] != ['Cargo.lock']:
+            raise ValueError('Lockfile transport contains unexpected paths')
+        run('git', 'apply', '--include=Cargo.lock', '-', input=diff.decode('utf-8'))
+    path = Path('Cargo.lock')
+    if path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o111:
+        raise ValueError('Cargo.lock must be a regular non-executable file')
+    if validate_lock(lock_bytes('HEAD'), path.read_bytes()) != expected:
+        raise ValueError('Cargo.lock differs from the verifier output')
+
+
+def lock_summary(before, after):
+    def packages(data):
+        result = {}
+        for package in tomllib.loads(data.decode('utf-8'))['package']:
+            result.setdefault(package['name'], set()).add(package['version'])
+        return result
+    old, new = packages(before), packages(after)
+    changes = [f"- {name}: {', '.join(sorted(old.get(name, []))) or '(new)'} → {', '.join(sorted(new.get(name, []))) or '(removed)'}"
+               for name in sorted(old.keys() | new.keys()) if old.get(name) != new.get(name)]
+    return '\n'.join(changes) or 'No package version changes.'
+
+
 def validate_candidate(sha, expected_base=None, expected_generated=None):
     if not SHA.fullmatch(sha):
         raise ValueError('Expected full candidate SHA')
@@ -90,16 +158,18 @@ def validate_candidate(sha, expected_base=None, expected_generated=None):
     if len(parents) != 2 or (expected_base and parents[1] != expected_base):
         raise ValueError('Candidate must have the captured main as its only parent')
     files = set(git('diff-tree', '--no-commit-id', '--name-only', '-r', sha).splitlines())
-    if files != ALLOWED:
+    if not ALLOWED - {'Cargo.lock'} <= files or not files <= ALLOWED:
         raise ValueError(f'Unexpected candidate files: {sorted(files)}')
     identity = git('show', '-s', '--format=%an%n%ae%n%cn%n%ce', sha).splitlines()
     if identity != [BOT_NAME, BOT_EMAIL, BOT_NAME, BOT_EMAIL]:
         raise ValueError('Candidate has an unexpected author or committer')
     plan = json.loads(git('show', f'{sha}:release-plan.json'))
-    if set(plan) != {'version', 'tag', 'upstream', 'generated', 'base'}:
+    if set(plan) != {'version', 'tag', 'upstream', 'generated', 'base', 'lock'}:
         raise ValueError('Unexpected release plan fields')
     if not VERSION.fullmatch(plan['version']) or plan['base'] != parents[1]:
         raise ValueError('Invalid release plan version or base')
+    if validate_lock(lock_bytes(parents[1]), lock_bytes(sha)) != plan['lock']:
+        raise ValueError('Release plan lock digest does not match Cargo.lock')
     tag_key(plan['tag'])
     if not all(SHA.fullmatch(plan[x]) for x in ('upstream', 'generated', 'base')):
         raise ValueError('Invalid SDK commit')
@@ -196,13 +266,14 @@ def candidate(args):
     if success:
         if not SHA.fullmatch(generated):
             raise ValueError('Invalid verifier output')
+        apply_lock(os.environ['LOCK_DIFF'], os.environ['LOCK_HASH'])
         run('bash', 'scripts/sdk-generate.sh')
         if git('-C', 'tuta-repo', 'rev-parse', 'HEAD') != generated:
             raise ValueError('Regeneration differs from verified SDK')
         sdk_branch = f'generated/{stem}-{generated[:12]}'
         push(FORK, generated, sdk_branch, os.environ['SDK_BUMP_TOKEN'], 'tuta-repo')
         git('config', '-f', '.gitmodules', 'submodule.tuta-repo.branch', sdk_branch)
-        plan = dict(version=os.environ['VERSION'], tag=tag, upstream=upstream, generated=generated, base=base)
+        plan = dict(version=os.environ['VERSION'], tag=tag, upstream=upstream, generated=generated, base=base, lock=os.environ['LOCK_HASH'])
         Path('release-plan.json').write_text(json.dumps(plan, indent=2) + '\n')
         git('add', *sorted(ALLOWED))
     else:
@@ -230,6 +301,8 @@ def candidate(args):
     url = f"https://github.com/{REPO}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
     body = f"Moves the SDK to `{tag}`.\n\n"
     body += ('Every patch passed the SDK tests. The exact candidate must pass bridge CI before automatic integration and release.' if success else '**SDK verification failed.** This diagnostic PR is never automatically integrated. Fix the patch series on main and rerun the workflow.')
+    if success:
+        body += '\n\nCargo.lock:\n' + lock_summary(lock_bytes(base), lock_bytes(source))
     open_pr(branch, f'Build on Tuta release {stem}', body + f'\n\n[Workflow evidence]({url}).')
     outputs(source=source if success else '', version=os.environ.get('VERSION', ''), ready=success)
 
@@ -247,7 +320,7 @@ def integrate(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['detect', 'candidate', 'integrate'])
+    parser.add_argument('command', choices=['detect', 'candidate', 'integrate', 'lock'])
     parser.add_argument('--tag', default='')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--scheduled', action='store_true')

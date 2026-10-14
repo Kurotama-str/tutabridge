@@ -99,10 +99,13 @@ the next weekly wake-up; the fortnightly gate applies only to new bumps.
 A manual run bypasses the date guard.
 The GUI checks for published updates every six hours; this is a separate clock.
 
-The workflow tests every patch in a job without publication credentials,
-regenerates the same SDK commit in a fresh Git-only job, and opens a candidate
+The workflow tests every patch and resolves the bridge lockfile conservatively
+in a job without publication credentials, including during dry runs. It checks
+locked Cargo metadata and passes only a bounded lockfile diff and its SHA256
+to the publishing job. New dependency sources require review. It regenerates the same SDK commit in a fresh Git-only job, and opens a candidate
 PR. Full bridge CI runs against that exact commit. Only the expected SDK pin,
-base, submodule branch and `release-plan.json` may change. The candidate is
+base, submodule branch, `Cargo.lock` and `release-plan.json` may change.
+Bridge builds and tests use `--locked`; they cannot repair a stale lock silently. The candidate is
 integrated with a normal fast-forward only while main is still its captured
 parent. Human changes to candidate branches are never overwritten.
 
@@ -111,7 +114,7 @@ already incorporated a patch, review and remove it from `sdk/patches` before
 rerunning. Offline tests do not establish that the live Tuta service accepts
 the SDK; there is no live account test in this pipeline.
 
-`release-plan.json` records the next rc version and SDK commits. Its introducing
+`release-plan.json` records the next rc version, SDK commits and lockfile SHA256. Its introducing
 commit is the immutable release source. If packaging or publication fails,
 rerunning SDK bump resumes that plan before considering a newer SDK. Builds
 run on Linux, macOS and Windows without signing keys or persisted Git credentials.

@@ -60,6 +60,8 @@ jobs:
     outputs:
       generated: ${{ steps.generate.outputs.generated }}
       message: ${{ steps.generate.outputs.message }}
+      lock_diff: ${{ steps.lock.outputs.lock_diff }}
+      lock_hash: ${{ steps.lock.outputs.lock_hash }}
     env:
       TAG: ${{ needs.detect.outputs.tag }}
       COMMIT: ${{ needs.detect.outputs.upstream }}
@@ -124,6 +126,10 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
 
+      - name: Resolve bridge lockfile and verify locked metadata
+        id: lock
+        run: python3 scripts/sdk-release.py lock
+
   candidate:
     needs: [detect, verify]
     if: always() && needs.detect.result == 'success' && needs.detect.outputs.mode == 'bump' && !inputs.dry_run && !cancelled()
@@ -150,6 +156,8 @@ jobs:
           VERSION: ${{ needs.detect.outputs.version }}
           VERIFIED: ${{ needs.verify.result }}
           GENERATED: ${{ needs.verify.outputs.generated }}
+          LOCK_DIFF: ${{ needs.verify.outputs.lock_diff }}
+          LOCK_HASH: ${{ needs.verify.outputs.lock_hash }}
         run: python3 scripts/sdk-release.py candidate
 
   # The candidate PR also runs ordinary PR CI; this explicit call is the

@@ -82,10 +82,10 @@ jobs:
       # Advisory for now — the codebase still has a handful of clippy lints.
       # Tighten to `-- -D warnings` once they're cleared.
       - name: Clippy
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --locked --workspace --all-targets
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
       - name: Test release coordination
         run: python3 -m unittest discover -s scripts/tests -v
@@ -118,7 +118,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake nasm libdbus-1-dev pkg-config
 
       - name: Build CLI (lean, no GUI)
-        run: cargo build --release -p tutabridge
+        run: cargo build --locked --release -p tutabridge
 
       # Same check as on macOS: GNU tools and Ubuntu's git must generate the
       # same SDK commit.
@@ -126,7 +126,7 @@ jobs:
         run: scripts/sdk-generate.sh --check
 
       - name: Test core and the SDK extensions
-        run: cargo test -p tutabridge-core -p tutabridge-tuta
+        run: cargo test --locked -p tutabridge-core -p tutabridge-tuta
 
   desktop:
     # Compile the platform-specific tray and single-instance implementations.

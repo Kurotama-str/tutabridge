@@ -1,4 +1,7 @@
 import contextlib
+import base64
+import gzip
+import hashlib
 from datetime import date, timedelta
 import importlib.util
 import json
@@ -94,6 +97,7 @@ class GitCandidate(unittest.TestCase):
         Path('sdk').mkdir()
         Path('sdk/BASE').write_text('tag=tutanota-release-360.260922.0\ncommit=' + '1'*40 + '\n')
         Path('.gitmodules').write_text('[submodule "tuta-repo"]\n\tpath = tuta-repo\n\turl = https://github.com/spartanz51/tutanota.git\n\tbranch = old\n')
+        Path('Cargo.lock').write_text('version = 4\n[[package]]\nname = "sdk"\nversion = "360.0.0"\n')
         sdk.git('add', '.')
         sdk.git('update-index', '--add', '--cacheinfo', f'160000,{"1"*40},tuta-repo')
         sdk.git('commit', '-qm', 'base')
@@ -102,14 +106,87 @@ class GitCandidate(unittest.TestCase):
         sdk.set_base('tutanota-release-361.261006.0', '2'*40)
         sdk.git('config', '-f', '.gitmodules', 'submodule.tuta-repo.branch', 'generated/361.261006.0-' + '3'*12)
         self.plan = dict(base=self.base, version='0.1.0-rc.14', tag='tutanota-release-361.261006.0', upstream='2'*40, generated='3'*40)
+        Path('Cargo.lock').write_text(Path('Cargo.lock').read_text().replace('360.0.0', '361.0.0'))
+        self.plan['lock'] = hashlib.sha256(Path('Cargo.lock').read_bytes()).hexdigest()
         Path('release-plan.json').write_text(json.dumps(self.plan))
-        sdk.git('add', 'sdk/BASE', '.gitmodules', 'release-plan.json')
+        sdk.git('add', 'sdk/BASE', '.gitmodules', 'release-plan.json', 'Cargo.lock')
         sdk.git('update-index', '--cacheinfo', f'160000,{"3"*40},tuta-repo')
         sdk.git('commit', '-qm', 'candidate')
         self.source = sdk.git('rev-parse', 'HEAD')
 
     def test_accepts_exact_candidate(self):
         self.assertEqual(sdk.validate_candidate(self.source, self.base, '3'*40), self.plan)
+
+    def test_lock_digest_is_required_and_matches_candidate(self):
+        original = Path('release-plan.json').read_text()
+        for digest in (None, '0'*64):
+            if digest is None:
+                self.plan.pop('lock', None)
+            else:
+                self.plan['lock'] = digest
+            Path('release-plan.json').write_text(json.dumps(self.plan))
+            with self.assertRaises(ValueError):
+                sdk.validate_candidate(self.amend())
+        Path('release-plan.json').write_text(original)
+        Path('Cargo.lock').write_bytes(sdk.lock_bytes(self.base))
+        with self.assertRaisesRegex(ValueError, 'digest'):
+            sdk.validate_candidate(self.amend())
+
+    def test_unchanged_lock_is_allowed_with_matching_digest(self):
+        Path('Cargo.lock').write_bytes(sdk.lock_bytes(self.base))
+        self.plan['lock'] = hashlib.sha256(Path('Cargo.lock').read_bytes()).hexdigest()
+        Path('release-plan.json').write_text(json.dumps(self.plan))
+        self.assertEqual(sdk.validate_candidate(self.amend()), self.plan)
+
+    def test_lock_transport_applies_only_verified_regular_file(self):
+        diff = subprocess.check_output(['git','diff',self.base,self.source,'--','Cargo.lock'])
+        encoded = base64.b64encode(gzip.compress(diff)).decode()
+        sdk.git('checkout','--detach',self.base)
+        sdk.apply_lock(encoded,self.plan['lock'])
+        self.assertEqual(hashlib.sha256(Path('Cargo.lock').read_bytes()).hexdigest(),self.plan['lock'])
+        sdk.git('checkout','--','Cargo.lock')
+        with self.assertRaisesRegex(ValueError,'verifier output'):
+            sdk.apply_lock(encoded,'0'*64)
+        sdk.git('checkout','--','Cargo.lock')
+        foreign = diff.replace(b'Cargo.lock',b'other.txt')
+        with self.assertRaisesRegex(ValueError,'unexpected paths'):
+            sdk.apply_lock(base64.b64encode(gzip.compress(foreign)).decode(),self.plan['lock'])
+        self.assertFalse(Path('other.txt').exists())
+        with self.assertRaises(ValueError):
+            sdk.apply_lock('a'*(sdk.LOCK_ENCODED_LIMIT+1),self.plan['lock'])
+        with self.assertRaisesRegex(ValueError,'decompression limit'):
+            sdk.apply_lock(base64.b64encode(gzip.compress(b'x'*(sdk.LOCK_DIFF_LIMIT+1))).decode(),self.plan['lock'])
+        Path('Cargo.lock').unlink(); Path('Cargo.lock').symlink_to('sdk/BASE')
+        with self.assertRaisesRegex(ValueError,'regular'):
+            sdk.apply_lock(base64.b64encode(gzip.compress(b'')).decode(),self.plan['lock'])
+
+    def test_new_source_requires_review_but_version_updates_are_allowed(self):
+        before=b'version=4\n[[package]]\nname="dep"\nversion="1.0.0"\nsource="registry+https://github.com/rust-lang/crates.io-index"\n'
+        after=before.replace(b'1.0.0',b'2.0.0')
+        self.assertEqual(sdk.validate_lock(before,after),hashlib.sha256(after).hexdigest())
+        for extra in (b'[[package]]\nname="new"\nversion="1.0.0"\nsource="git+https://example.test/new"\n',b'[patch]\nunused=[]\n'):
+            with self.assertRaisesRegex(ValueError,'requires review'):
+                sdk.validate_lock(before,after+extra)
+
+    def test_successful_candidate_carries_verifier_lock_and_digest(self):
+        diff=subprocess.check_output(['git','diff',self.base,self.source,'--','Cargo.lock'])
+        sdk.git('checkout','--detach',self.base)
+        real_git,real_run=sdk.git,sdk.run
+        def git(*args):
+            if args[0]=='ls-remote': return ''
+            if args[:2]==('-C','tuta-repo'): return '3'*40
+            if args[0]=='add' and 'tuta-repo' in args:
+                real_git('add',*[p for p in args[1:] if p!='tuta-repo'])
+                return real_git('update-index','--cacheinfo',f'160000,{"3"*40},tuta-repo')
+            return real_git(*args)
+        def run(*args,**kwargs):
+            return '' if args[:2]==('bash','scripts/sdk-generate.sh') else real_run(*args,**kwargs)
+        env=dict(BASE=self.base,TAG=self.plan['tag'],UPSTREAM_SHA='2'*40,GENERATED='3'*40,VERIFIED='success',VERSION=self.plan['version'],GITHUB_RUN_ID='123',SDK_BUMP_TOKEN='fixture',LOCK_DIFF=base64.b64encode(gzip.compress(diff)).decode(),LOCK_HASH=self.plan['lock'])
+        with patch.dict(os.environ,env),patch.object(sdk,'git',side_effect=git),patch.object(sdk,'run',side_effect=run),patch.object(sdk,'push'),patch.object(sdk,'open_pr') as pr,patch.object(sdk,'outputs') as out:
+            sdk.candidate(None)
+            self.assertTrue(out.call_args.kwargs['ready'])
+            self.assertEqual(sdk.validate_candidate(out.call_args.kwargs['source']),self.plan)
+            self.assertIn('sdk: 360.0.0 → 361.0.0',pr.call_args.args[2])
 
     def test_rejects_wrong_base_and_sdk(self):
         for base, generated in [('4'*40, '3'*40), (self.base, '4'*40)]:
@@ -204,6 +281,32 @@ class GitCandidate(unittest.TestCase):
             self.assertIn('never automatically integrated',pr.call_args.args[2])
             self.assertEqual(real_git('diff-tree','--no-commit-id','--name-only','-r','HEAD'),'sdk/BASE')
             self.assertEqual(real_git('show','-s','--format=%an%n%ae%n%cn%n%ce','HEAD').splitlines(),[sdk.BOT_NAME,sdk.BOT_EMAIL,sdk.BOT_NAME,sdk.BOT_EMAIL])
+
+
+class CargoLockResolution(unittest.TestCase):
+    def test_path_version_bump_is_resolved_and_transport_stays_locked(self):
+        with tempfile.TemporaryDirectory() as scratch,cwd(scratch):
+            sdk.git('init','-q')
+            Path('src').mkdir();Path('src/lib.rs').write_text('')
+            Path('sdk/src').mkdir(parents=True);Path('sdk/src/lib.rs').write_text('')
+            Path('Cargo.toml').write_text('[workspace]\nexclude=["sdk"]\n[package]\nname="bridge"\nversion="1.0.0"\nedition="2021"\n[dependencies]\nsdk={path="sdk"}\n')
+            manifest=Path('sdk/Cargo.toml')
+            manifest.write_text('[package]\nname="sdk"\nversion="1.0.0"\nedition="2021"\n')
+            with patch.dict(os.environ,CARGO_NET_OFFLINE='true'):
+                sdk.run('cargo','generate-lockfile')
+                sdk.git('add','.')
+                sdk.git('-c','user.name=fixture','-c','user.email=fixture@example.test','-c','commit.gpgSign=false','commit','-qm','base')
+                manifest.write_text(manifest.read_text().replace('1.0.0','2.0.0'))
+                result=subprocess.run(['cargo','metadata','--locked','--format-version','1'],capture_output=True)
+                self.assertNotEqual(result.returncode,0)
+                self.assertIn(b'lock',result.stderr)
+                with patch.object(sdk,'outputs') as out:
+                    sdk.lock(None)
+                encoded,digest=out.call_args.kwargs['lock_diff'],out.call_args.kwargs['lock_hash']
+                sdk.git('checkout','--','Cargo.lock')
+                sdk.apply_lock(encoded,digest)
+                metadata=json.loads(sdk.run('cargo','metadata','--locked','--format-version','1'))
+                self.assertEqual(next(p['version'] for p in metadata['packages'] if p['name']=='sdk'),'2.0.0')
 
 
 class Assets(unittest.TestCase):
