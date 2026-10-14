@@ -209,8 +209,13 @@ def candidate(args):
         git('add', 'sdk/BASE')
     git('config', 'user.name', BOT_NAME)
     git('config', 'user.email', BOT_EMAIL)
-    git('-c', 'commit.gpgSign=false', 'commit', '-m', f'Build on Tuta release {stem}')
+    identity = dict(os.environ, GIT_AUTHOR_NAME=BOT_NAME, GIT_AUTHOR_EMAIL=BOT_EMAIL,
+                    GIT_COMMITTER_NAME=BOT_NAME, GIT_COMMITTER_EMAIL=BOT_EMAIL)
+    run('git', '-c', 'commit.gpgSign=false', '-c', 'core.hooksPath=/dev/null',
+        'commit', '-m', f'Build on Tuta release {stem}', env=identity)
     source = git('rev-parse', 'HEAD')
+    if success:
+        validate_candidate(source, base, generated)
     remote = git('ls-remote', 'origin', f'refs/heads/{branch}')
     if remote:
         git('fetch', '--quiet', 'origin', f'refs/heads/{branch}')

@@ -195,7 +195,7 @@ class GitCandidate(unittest.TestCase):
         real_git = sdk.git
         def git(*args):
             return '' if args[0]=='ls-remote' else real_git(*args)
-        env = dict(BASE=self.base,TAG='tutanota-release-361.261006.0',UPSTREAM_SHA='2'*40,VERIFIED='failure',VERSION='0.1.0-rc.14',GITHUB_RUN_ID='123')
+        env = dict(BASE=self.base,TAG='tutanota-release-361.261006.0',UPSTREAM_SHA='2'*40,VERIFIED='failure',VERSION='0.1.0-rc.14',GITHUB_RUN_ID='123',GIT_AUTHOR_NAME='Inherited',GIT_AUTHOR_EMAIL='inherited@example.test',GIT_COMMITTER_NAME='Inherited',GIT_COMMITTER_EMAIL='inherited@example.test')
         with patch.dict(os.environ,env),patch.object(sdk,'git',side_effect=git),patch.object(sdk,'push') as push,patch.object(sdk,'open_pr') as pr,patch.object(sdk,'outputs') as out:
             sdk.candidate(None)
             self.assertFalse(out.call_args.kwargs['ready'])
@@ -203,6 +203,7 @@ class GitCandidate(unittest.TestCase):
             self.assertTrue(push.call_args.args[2].endswith('-diagnostic'))
             self.assertIn('never automatically integrated',pr.call_args.args[2])
             self.assertEqual(real_git('diff-tree','--no-commit-id','--name-only','-r','HEAD'),'sdk/BASE')
+            self.assertEqual(real_git('show','-s','--format=%an%n%ae%n%cn%n%ce','HEAD').splitlines(),[sdk.BOT_NAME,sdk.BOT_EMAIL,sdk.BOT_NAME,sdk.BOT_EMAIL])
 
 
 class Assets(unittest.TestCase):
