@@ -170,6 +170,7 @@ jobs:
 
   sign:
     needs: [source, build]
+    if: always() && !cancelled() && needs.source.result == 'success' && needs.build.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
