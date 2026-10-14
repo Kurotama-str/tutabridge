@@ -61,7 +61,7 @@ jobs:
         run: |
           sha=$(git rev-parse --verify --end-of-options "$SOURCE_REF^{commit}")
           if [ "$PUBLISH" = true ]; then
-            git merge-base --is-ancestor "$sha" origin/main
+            python3 scripts/release-assets.py check-source --source "$sha"
           fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
 

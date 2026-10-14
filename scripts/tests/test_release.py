@@ -188,6 +188,36 @@ class GitCandidate(unittest.TestCase):
             self.assertEqual(sdk.validate_candidate(out.call_args.kwargs['source']),self.plan)
             self.assertIn('sdk: 360.0.0 → 361.0.0',pr.call_args.args[2])
 
+    def test_release_source_reads_remote_main_instead_of_checkout_ref(self):
+        remote = self.location / 'remote.git'
+        sdk.git('clone', '--bare', '--quiet', '.', str(remote))
+        sdk.git('remote', 'add', 'origin', str(remote))
+        sdk.git('update-ref', 'refs/remotes/origin/main', self.base)
+        stale = subprocess.run(['git', 'merge-base', '--is-ancestor', self.source, 'origin/main'])
+        self.assertNotEqual(stale.returncode, 0)
+        args = type('Args', (), dict(source=self.source))()
+        assets.check_source(args)
+        # Execute the actual workflow block, with its real CLI helper.
+        workflow = (SCRIPTS.parent / '.github/workflows/release.yml').read_text()
+        body = workflow.split('        name: Resolve immutable source', 1)[1].split('        run: |\n', 1)[1]
+        lines = []
+        for line in body.splitlines():
+            if line and not line.startswith('          '): break
+            lines.append(line[10:])
+        Path('scripts').mkdir()
+        shutil.copy2(SCRIPTS / 'release-assets.py', 'scripts/release-assets.py')
+        output = self.location / 'workflow-output'
+        env = dict(os.environ, SOURCE_REF=self.source, PUBLISH='true', GITHUB_OUTPUT=str(output))
+        subprocess.run(['bash', '-e', '-c', '\n'.join(lines)], env=env, check=True)
+        self.assertEqual(output.read_text(), f'sha={self.source}\n')
+        divergent = sdk.run('git', 'commit-tree', sdk.git('rev-parse', self.source+'^{tree}'), '-p', self.base, input='divergent\n')
+        args.source = divergent
+        with self.assertRaises(subprocess.CalledProcessError): assets.check_source(args)
+        failed = subprocess.run(['bash', '-e', '-c', '\n'.join(lines)], env=dict(env, SOURCE_REF=divergent), capture_output=True)
+        self.assertNotEqual(failed.returncode, 0)
+        sdk.git('--git-dir', str(remote), 'update-ref', '-d', 'refs/heads/main')
+        with self.assertRaisesRegex(ValueError, 'remote main'): assets.check_source(args)
+
     def test_rejects_wrong_base_and_sdk(self):
         for base, generated in [('4'*40, '3'*40), (self.base, '4'*40)]:
             with self.assertRaises(ValueError):
@@ -374,6 +404,9 @@ class Assets(unittest.TestCase):
 class PublicationRecovery(unittest.TestCase):
     def setUp(self):
         Assets.setUp(self)
+        check = patch.object(assets, 'check_source')
+        self.source_check = check.start()
+        self.addCleanup(check.stop)
         for name in set(assets.PAYLOADS.values()):
             (self.directory / (name + '.sig')).write_text('signature')
         self.key = self.directory.parent / (self.directory.name + '.pub')
@@ -388,7 +421,8 @@ class PublicationRecovery(unittest.TestCase):
     def test_published_release_is_immutable(self):
         with patch.object(assets, 'verify_signature'), patch.object(assets, 'release_state', return_value=({'draft':False}, True)), patch.object(assets, 'run') as run, patch.object(assets, 'api') as api:
             assets.publish(self.args)
-            self.assertEqual(run.call_count, 1)  # ancestry check only
+            self.source_check.assert_called_once_with(self.args)
+            run.assert_not_called()  # no upload or release mutation
             api.assert_not_called()
 
     def test_wrong_manifest_version_refused_before_api(self):

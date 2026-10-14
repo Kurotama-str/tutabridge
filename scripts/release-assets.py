@@ -158,6 +158,18 @@ def release_state(version, source):
     return release, bool(refs)
 
 
+def check_source(args):
+    if not re.fullmatch('[0-9a-f]{40}', args.source):
+        raise ValueError('Release source must be a full SHA')
+    # checkout may pin origin/main to the workflow's starting commit, even
+    # when a preceding job has already advanced the remote branch.
+    remote = run('git', 'ls-remote', 'origin', 'refs/heads/main').split()
+    if len(remote) != 2 or remote[1] != 'refs/heads/main' or not re.fullmatch('[0-9a-f]{40}', remote[0]):
+        raise ValueError('Cannot resolve remote main')
+    run('git', 'fetch', '--quiet', '--no-tags', 'origin', remote[0])
+    run('git', 'merge-base', '--is-ancestor', args.source, remote[0])
+
+
 def publish(args):
     directory = Path(args.directory)
     pubkey = Path(args.pubkey).read_text().strip()
@@ -166,7 +178,7 @@ def publish(args):
     if actual['version'] != expected['version'] or actual['platforms'] != expected['platforms']:
         raise ValueError('Updater manifest does not match the signed payloads')
     # Publishing from an old main commit supports a new-version rollback.
-    run('git', 'merge-base', '--is-ancestor', args.source, 'origin/main')
+    check_source(args)
     existing, tagged = release_state(args.version, args.source)
     if existing and not existing['draft']:
         print('Release already published; leaving it unchanged')
@@ -201,7 +213,7 @@ def publish(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['prepare', 'collect', 'sign', 'publish'])
+    parser.add_argument('command', choices=['prepare', 'collect', 'sign', 'publish', 'check-source'])
     parser.add_argument('--version', default='0.1.0-rc.0')
     parser.add_argument('--directory', default='release-assets')
     parser.add_argument('--bundle', default='target/release/bundle')
@@ -210,4 +222,4 @@ if __name__ == '__main__':
     parser.add_argument('--source')
     args = parser.parse_args()
     app_version(args.version)
-    globals()[args.command](args)
+    globals()[args.command.replace('-', '_')](args)
