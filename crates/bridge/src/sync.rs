@@ -335,13 +335,12 @@ impl MailStore {
         }
     }
 
-    pub(crate) async fn update_mail_details(
+    pub(crate) async fn update_complete_mail(
         &self,
         folder_id: &str,
         element_id: &str,
-        details: MailDetails,
+        details: Option<MailDetails>,
         rfc2822: String,
-        attachments_pending: bool,
     ) {
         let mut folders = self.folders.write().await;
         if let Some(folder) = folders.get_mut(folder_id) {
@@ -354,41 +353,14 @@ impl MailStore {
                     == Some(element_id)
             }) {
                 m.body_loaded = true;
-                m.attachments_pending = attachments_pending;
+                m.attachments_pending = false;
             }
         }
         drop(folders);
         self.bodies.insert(
             element_id,
-            crate::body_cache::BodyEntry {
-                details: Some(details),
-                rfc2822,
-            },
+            crate::body_cache::BodyEntry { details, rfc2822 },
         );
-        self.bump_details_generation();
-    }
-
-    /// Rewrite just the cached RFC 2822 for a mail (and clear its pending
-    /// flag) after a successful attachment-only retry. The mail's details
-    /// are already in store from the original prefetch; we only need to
-    /// refresh the body so the next IMAP FETCH BODY[] returns the
-    /// multipart envelope.
-    async fn update_mail_rfc2822(&self, folder_id: &str, element_id: &str, rfc2822: String) {
-        let mut folders = self.folders.write().await;
-        if let Some(folder) = folders.get_mut(folder_id) {
-            if let Some(m) = folder.iter_mut().find(|m| {
-                m.mail
-                    ._id
-                    .as_ref()
-                    .map(|id| id.element_id.to_string())
-                    .as_deref()
-                    == Some(element_id)
-            }) {
-                m.attachments_pending = false;
-            }
-        }
-        drop(folders);
-        self.bodies.update_rfc2822(element_id, rfc2822);
         self.bump_details_generation();
     }
 
@@ -615,12 +587,9 @@ async fn prefetch_loop(
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut store_watch = store.subscribe();
-    // Per-mail throttle for attachment retries — keys are element ids,
-    // values are the instant we last attempted the retry. We hold this map
-    // in the prefetch_loop's stack so it survives across store generations
-    // but resets on bridge restart. The session-key-transient race typically
-    // resolves within a couple of minutes, so a 60s minimum gap is plenty.
-    let mut attachment_retry_history: HashMap<String, std::time::Instant> = HashMap::new();
+    // Retry state survives store updates, but not a restart. Unknown or
+    // transient failures back off to one hour; contract failures start there.
+    let mut attachment_retry_history: HashMap<String, AttachmentRetry> = HashMap::new();
     loop {
         if *shutdown.borrow() {
             return;
@@ -644,11 +613,7 @@ async fn prefetch_loop(
         // must wake up after the throttle window even if nothing else
         // touches the store — otherwise the retry loop relies on another
         // mail arriving to be re-triggered.
-        let next_tick = if attachment_retry_history.is_empty() {
-            None
-        } else {
-            Some(ATTACHMENT_RETRY_THROTTLE)
-        };
+        let next_tick = next_attachment_retry(&attachment_retry_history, Instant::now());
         tokio::select! {
             _ = store_watch.changed() => {}
             _ = shutdown.changed() => return,
@@ -662,13 +627,42 @@ async fn prefetch_loop(
     }
 }
 
-/// Minimum interval between two attempts to reload a mail's attachments
-/// after a session-key-transient failure. Stops a tight retry loop while
-/// still recovering within ~1 minute once the server propagates the
-/// `_ownerEncSessionKey` / `_ownerGroup` fields.
-const ATTACHMENT_RETRY_THROTTLE: Duration = Duration::from_secs(60);
+const ATTACHMENT_RETRY_MIN: Duration = Duration::from_secs(60);
+const ATTACHMENT_RETRY_MAX: Duration = Duration::from_secs(3600);
 
-async fn load_cached_folder(
+pub(crate) struct AttachmentRetry {
+    failures: u32,
+    next_attempt: Instant,
+}
+
+impl AttachmentRetry {
+    fn after_failure(previous: Option<&Self>, retryable: bool, now: Instant) -> Self {
+        let failures = previous.map_or(1, |previous| previous.failures.saturating_add(1));
+        let delay = if retryable {
+            (ATTACHMENT_RETRY_MIN * (1 << failures.saturating_sub(1).min(6)))
+                .min(ATTACHMENT_RETRY_MAX)
+        } else {
+            ATTACHMENT_RETRY_MAX
+        };
+        Self {
+            failures,
+            next_attempt: now + delay,
+        }
+    }
+}
+
+fn next_attachment_retry(
+    history: &HashMap<String, AttachmentRetry>,
+    now: Instant,
+) -> Option<Duration> {
+    history
+        .values()
+        .filter_map(|retry| retry.next_attempt.checked_duration_since(now))
+        .filter(|delay| !delay.is_zero())
+        .min()
+}
+
+pub(crate) async fn load_cached_folder(
     store: &MailStore,
     local_store: &Arc<LocalStore>,
     folder: &FolderInfo,
@@ -841,233 +835,107 @@ pub(crate) async fn sync_folder(
     Ok(())
 }
 
-async fn prefetch_details(
+pub(crate) async fn prefetch_details(
     store: &MailStore,
     local_store: &LocalStore,
     backend: &dyn MailBackend,
     folder: &FolderInfo,
     body_prefetch_limit: usize,
-    attachment_retry_history: &mut HashMap<String, std::time::Instant>,
+    attachment_retry_history: &mut HashMap<String, AttachmentRetry>,
 ) {
     let mails = store.get_folder(&folder.id).await;
-
-    // Body prefetch is the *capped* part: eagerly pull bodies only for the
-    // newest `body_prefetch_limit` messages (the store is newest-first).
-    // `0` = no cap (prefetch every body). Bodies beyond the window are fetched
-    // on demand when the client FETCHes them. (Metadata for the whole folder
-    // is always present — see `sync_folder`.)
-    let prefetch_window: &[StoredMail] = if body_prefetch_limit == 0 {
-        &mails
+    let window = if body_prefetch_limit == 0 {
+        &mails[..]
     } else {
         &mails[..mails.len().min(body_prefetch_limit)]
     };
-
-    // First pass — messages in the prefetch window still missing their `.eml`.
-    let api_needed: Vec<Mail> = prefetch_window
-        .iter()
-        .filter(|m| !m.body_loaded)
-        .filter_map(|m| {
-            let eid = m.mail._id.as_ref()?.element_id.to_string();
-            if local_store.has_eml(&eid) {
-                None
-            } else {
-                Some(m.mail.clone())
-            }
-        })
-        .collect();
-
-    // Second pass — mails whose body is already cached but whose attachments
-    // failed to load on the first try because the server hadn't propagated
-    // their session-key metadata yet. Throttled per element id so we don't
-    // hammer the server every store mutation.
-    let now = std::time::Instant::now();
-    let attachment_retry_needed: Vec<(StoredMail, MailDetails)> = mails
-        .iter()
-        .filter_map(|m| {
-            if !m.attachments_pending {
-                return None;
-            }
-            let eid = m.mail._id.as_ref()?.element_id.to_string();
-            // A pending mail is fresh (the race resolves within minutes), so
-            // its details are still hot in the body cache. If they were
-            // evicted, skip this sweep; the pending flag keeps it eligible.
-            let details = store.bodies().cached(&eid)?.details.clone()?;
-            if let Some(last) = attachment_retry_history.get(&eid) {
-                if now.duration_since(*last) < ATTACHMENT_RETRY_THROTTLE {
-                    return None;
-                }
-            }
-            Some((m.clone(), details))
-        })
-        .collect();
-
-    if api_needed.is_empty() && attachment_retry_needed.is_empty() {
-        return;
-    }
-
-    if !api_needed.is_empty() {
-        debug!(
-            "Pre-fetching {} mail details for {}",
-            api_needed.len(),
-            folder.imap_path
-        );
-    }
-    if !attachment_retry_needed.is_empty() {
-        debug!(
-            "Retrying attachments for {} mail(s) in {}",
-            attachment_retry_needed.len(),
-            folder.imap_path
-        );
-    }
-
-    for mail in &api_needed {
-        tokio::time::sleep(INTER_REQUEST_DELAY).await;
-
-        let result = retry(|| backend.load_mail_details(mail)).await;
-        match result {
-            Ok(Some(details)) => {
-                let mut attachments_pending = false;
-                let attachments_owned = if mail.attachments.is_empty() {
-                    Vec::new()
-                } else {
-                    match backend.load_attachments(mail).await {
-                        Ok(atts) => atts,
-                        Err(e) => {
-                            attachments_pending = is_transient_attachment_error(&e);
-                            warn!(
-                                "Failed to load attachments for {}: {e} (will {})",
-                                mail._id
-                                    .as_ref()
-                                    .map(|id| id.element_id.to_string())
-                                    .unwrap_or_default(),
-                                if attachments_pending {
-                                    "retry on next prefetch sweep"
-                                } else {
-                                    "ship body-only"
-                                }
-                            );
-                            Vec::new()
-                        }
-                    }
-                };
-                let attachment_refs: Vec<(&TutanotaFile, &[u8])> = attachments_owned
-                    .iter()
-                    .map(|(f, d)| (f, d.as_slice()))
-                    .collect();
-                let rfc2822 = mail_to_rfc2822(mail, Some(&details), &attachment_refs);
-                if let Some(id) = mail._id.as_ref() {
-                    let eid = id.element_id.to_string();
-
-                    if let Err(e) = local_store.write_eml(&eid, &rfc2822) {
-                        warn!("Failed to cache eml {}: {}", eid, e);
-                    }
-                    if let Err(e) = local_store.mark_has_details(&eid) {
-                        warn!("Failed to mark has_details {}: {}", eid, e);
-                    }
-                    // Index the plain-text body for full-text search.
-                    let body_html = details
-                        .body
-                        .compressedText
-                        .as_deref()
-                        .or(details.body.text.as_deref())
-                        .unwrap_or("");
-                    if let Err(e) = local_store.index_body(&eid, &strip_html(body_html)) {
-                        warn!("Failed to index body {}: {}", eid, e);
-                    }
-                    if attachments_pending {
-                        attachment_retry_history.insert(eid.clone(), now);
-                    }
-
-                    store
-                        .update_mail_details(
-                            &folder.id,
-                            &eid,
-                            details,
-                            rfc2822,
-                            attachments_pending,
-                        )
-                        .await;
-                }
-            }
-            Ok(None) => {
-                // The mail references neither a `MailDetailsBlob` nor a
-                // `MailDetailsDraft` (legacy / malformed). Persist a
-                // headers-only `.eml` and mark the row done so we don't
-                // re-attempt every prefetch sweep.
-                let rfc2822 = mail_to_rfc2822(mail, None, &[]);
-                if let Some(id) = mail._id.as_ref() {
-                    let eid = id.element_id.to_string();
-                    if let Err(e) = local_store.write_eml(&eid, &rfc2822) {
-                        warn!("Failed to cache headers-only eml {}: {}", eid, e);
-                    }
-                    if let Err(e) = local_store.mark_has_details(&eid) {
-                        warn!("Failed to mark has_details {}: {}", eid, e);
-                    }
-                }
-            }
-            Err(e) => {
-                warn!("Failed to prefetch details for {:?}: {}", mail.subject, e);
-            }
+    for stored in window {
+        let mail = &stored.mail;
+        let Some(id) = &mail._id else { continue };
+        let eid = id.element_id.to_string();
+        if stored.body_loaded || local_store.has_eml(&eid) {
+            attachment_retry_history.remove(&eid);
+            continue;
         }
-    }
-
-    // Attachment-only retries. We already have the body & details cached
-    // in the store; only the multipart envelope needs rebuilding.
-    for (stored, details) in &attachment_retry_needed {
+        if attachment_retry_history
+            .get(&eid)
+            .is_some_and(|last| Instant::now() < last.next_attempt)
+        {
+            continue;
+        }
         tokio::time::sleep(INTER_REQUEST_DELAY).await;
-        let eid = match stored.mail._id.as_ref() {
-            Some(id) => id.element_id.to_string(),
-            None => continue,
+        let details = match retry(|| backend.load_mail_details(mail)).await {
+            Ok(details) => details,
+            Err(_) => {
+                warn!("Failed to prefetch message details");
+                let retry = AttachmentRetry::after_failure(
+                    attachment_retry_history.get(&eid),
+                    true,
+                    Instant::now(),
+                );
+                attachment_retry_history.insert(eid, retry);
+                continue;
+            }
         };
-        attachment_retry_history.insert(eid.clone(), std::time::Instant::now());
-
-        match backend.load_attachments(&stored.mail).await {
-            Ok(attachments) => {
-                let refs: Vec<(&TutanotaFile, &[u8])> =
-                    attachments.iter().map(|(f, d)| (f, d.as_slice())).collect();
-                let rfc2822 = mail_to_rfc2822(&stored.mail, Some(details), &refs);
-                if let Err(e) = local_store.write_eml(&eid, &rfc2822) {
-                    warn!("Failed to rewrite eml {}: {}", eid, e);
-                }
-                store.update_mail_rfc2822(&folder.id, &eid, rfc2822).await;
-                attachment_retry_history.remove(&eid);
-                debug!("Attachment retry succeeded for {}", eid);
-            }
-            Err(e) if is_transient_attachment_error(&e) => {
-                debug!(
-                    "Attachment retry for {} still transient: {e} (next attempt in {:?})",
-                    eid, ATTACHMENT_RETRY_THROTTLE
+        let attachments = match backend.load_attachments(mail).await {
+            Ok(attachments) => attachments,
+            Err(error) => {
+                let retry = AttachmentRetry::after_failure(
+                    attachment_retry_history.get(&eid),
+                    is_transient_attachment_error(&error),
+                    Instant::now(),
                 );
+                attachment_retry_history.insert(eid, retry);
+                warn!("Message remains unavailable: {error}");
+                continue;
             }
-            Err(e) => {
-                warn!(
-                    "Attachment retry for {} failed permanently: {e} — giving up",
-                    eid
-                );
-                // Clear the pending flag so we don't keep retrying a
-                // permanent failure (e.g. server returned 404). The body-only
-                // rendering already in the cache stays as-is.
-                let body_only = store
-                    .bodies()
-                    .cached(&eid)
-                    .map(|e| e.rfc2822.clone())
-                    .unwrap_or_default();
-                store.update_mail_rfc2822(&folder.id, &eid, body_only).await;
-                attachment_retry_history.remove(&eid);
+        };
+        let refs: Vec<(&TutanotaFile, &[u8])> =
+            attachments.iter().map(|(f, d)| (f, d.as_slice())).collect();
+        let rfc = mail_to_rfc2822(mail, details.as_ref(), &refs);
+        // Only complete messages become final cache entries, including mails without a body reference.
+        if let Err(error) = local_store.write_eml(&eid, &rfc) {
+            warn!("Failed to persist complete message: {error}");
+        } else if let Err(error) = local_store.mark_has_details(&eid) {
+            warn!("Failed to mark complete message: {error}");
+        }
+        if let Some(details) = &details {
+            let body_html = details
+                .body
+                .compressedText
+                .as_deref()
+                .or(details.body.text.as_deref())
+                .unwrap_or("");
+            let body_text = strip_html(body_html);
+            if let Err(error) = local_store.index_body(&eid, &body_text) {
+                warn!("Failed to index complete message: {error}");
             }
         }
+        store
+            .update_complete_mail(&folder.id, &eid, details, rfc)
+            .await;
+        attachment_retry_history.remove(&eid);
     }
 }
 
-/// True when an attachment-load failure is the well-known
-/// "freshly-created File without propagated session-key" race that the
-/// `TutaSession::load_file_with_retry` helper logs as
-/// "still not decryptable after retries". Matching on the string keeps us
-/// decoupled from the SDK error variant tree.
-fn is_transient_attachment_error(err: &str) -> bool {
-    err.contains("missing owner key/group data")
-        || err.contains("Session key resolution failure")
-        || err.contains("still not decryptable")
+fn is_transient_attachment_error(error: &tutabridge_tuta::mail::AttachmentError) -> bool {
+    use tutabridge_tuta::mail::AttachmentError;
+    use tutasdk::{rest_error::HttpError, ApiCallError};
+    match error {
+        AttachmentError::Contract(_) => false,
+        AttachmentError::Indeterminate(_) => true,
+        AttachmentError::Transport(ApiCallError::RestClient { .. }) => true,
+        AttachmentError::Transport(ApiCallError::ServerResponseError { source }) => matches!(
+            source,
+            HttpError::ConnectionError
+                | HttpError::RequestTimeoutError
+                | HttpError::TooManyRequestsError { .. }
+                | HttpError::InternalServerError
+                | HttpError::BadGatewayError
+                | HttpError::ServiceUnavailableError { .. }
+        ),
+        AttachmentError::Transport(ApiCallError::InternalSdkError { .. }) => true,
+    }
 }
 
 async fn retry<F, Fut, T>(mut f: F) -> Result<T, String>
@@ -1232,7 +1100,7 @@ mod tests {
         // A body landing must signal stats watchers without waking the list
         // watchers every idle IMAP session sleeps on (the clone storm).
         store
-            .update_mail_details("f", "e1", details, "body".into(), false)
+            .update_complete_mail("f", "e1", Some(details), "body".into())
             .await;
         assert!(
             !list_watch.has_changed().unwrap(),
@@ -1248,6 +1116,42 @@ mod tests {
             .set_folder("f", vec![stored(make_mail("l", "e2", "s2", true), 2)])
             .await;
         assert!(list_watch.has_changed().unwrap());
+    }
+
+    #[test]
+    fn attachment_retry_backoff_is_bounded_and_ignores_expired_deadlines() {
+        let now = Instant::now();
+        let mut previous = None;
+        for expected in [60, 120, 240, 480, 960, 1920, 3600, 3600] {
+            let retry = AttachmentRetry::after_failure(previous.as_ref(), true, now);
+            assert_eq!(
+                retry.next_attempt.duration_since(now),
+                Duration::from_secs(expected)
+            );
+            previous = Some(retry);
+        }
+        let permanent = AttachmentRetry::after_failure(None, false, now);
+        assert_eq!(
+            permanent.next_attempt.duration_since(now),
+            ATTACHMENT_RETRY_MAX
+        );
+        let mut history = HashMap::from([("failed".into(), permanent)]);
+        assert_eq!(
+            next_attachment_retry(&history, now),
+            Some(ATTACHMENT_RETRY_MAX)
+        );
+        assert_eq!(
+            next_attachment_retry(&history, now + ATTACHMENT_RETRY_MAX),
+            None
+        );
+        history.insert(
+            "recoverable".into(),
+            AttachmentRetry::after_failure(None, true, now),
+        );
+        assert_eq!(
+            next_attachment_retry(&history, now),
+            Some(ATTACHMENT_RETRY_MIN)
+        );
     }
 
     #[test]

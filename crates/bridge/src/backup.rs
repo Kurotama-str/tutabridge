@@ -417,7 +417,7 @@ mod tests {
         async fn load_attachments(
             &self,
             _mail: &Mail,
-        ) -> Result<Vec<(TutanotaFile, Vec<u8>)>, String> {
+        ) -> Result<Vec<(TutanotaFile, Vec<u8>)>, tutabridge_tuta::mail::AttachmentError> {
             Ok(vec![])
         }
         async fn load_mail(&self, _l: &str, _e: &str) -> Result<Option<Mail>, String> {

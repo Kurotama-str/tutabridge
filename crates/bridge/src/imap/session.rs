@@ -452,47 +452,27 @@ impl ImapSession {
                     }
                     let mail = self.mails[idx].mail.clone();
                     match self.backend.load_mail_details(&mail).await {
-                        Ok(Some(details)) => {
-                            let atts = self
-                                .backend
-                                .load_attachments(&mail)
-                                .await
-                                .unwrap_or_default();
+                        Ok(details) => {
+                            let atts = match self.backend.load_attachments(&mail).await {
+                                Ok(atts) => atts,
+                                Err(e) => {
+                                    log::warn!("On-demand attachments unavailable: {e}");
+                                    if let Some(eid) = &elem_id {
+                                        self.store.mark_body_fetch_failed(eid);
+                                    }
+                                    return vec![format!("{} NO [UNAVAILABLE] message attachments cannot be fetched\r\n", tag)];
+                                }
+                            };
                             let refs: Vec<(&TutanotaFile, &[u8])> =
                                 atts.iter().map(|(f, d)| (f, d.as_slice())).collect();
-                            let rfc = mail_to_rfc2822(&mail, Some(&details), &refs);
+                            let rfc = mail_to_rfc2822(&mail, details.as_ref(), &refs);
                             if let (Some(eid), Some(folder)) = (&elem_id, &self.selected_folder) {
-                                // Persist first: the in-memory cache is
-                                // bounded, so the encrypted `.eml.enc` is what
-                                // makes this fetch survive eviction/restart.
                                 self.persist_body(eid, &rfc);
-                                // Share into the store cache so other
-                                // connections (and stats) see it too.
                                 self.store
-                                    .update_mail_details(&folder.id, eid, details, rfc, false)
+                                    .update_complete_mail(&folder.id, eid, details, rfc)
                                     .await;
                             }
                             self.mails[idx].body_loaded = true;
-                        }
-                        Ok(None) => {
-                            // Legacy mail with no body reference — headers
-                            // only. Persist a headers-only `.eml` (as the
-                            // prefetch path does) so we don't re-hit the
-                            // network on every body FETCH of a message that
-                            // has no body.
-                            if let Some(eid) = &elem_id {
-                                let rfc = mail_to_rfc2822(&mail, None, &[]);
-                                self.persist_body(eid, &rfc);
-                                self.store.bodies().insert(
-                                    eid,
-                                    crate::body_cache::BodyEntry {
-                                        details: None,
-                                        rfc2822: rfc,
-                                    },
-                                );
-                            }
-                            self.mails[idx].body_loaded = true;
-                            debug!("uid={} has no body source", self.mails[idx].uid);
                         }
                         Err(e) => {
                             log::warn!(
@@ -1986,6 +1966,9 @@ mod tests {
         sent: Mutex<Vec<ParsedMessage>>,
         moved: Mutex<Vec<(Vec<IdTupleGenerated>, String)>>,
         fail_details: Mutex<bool>,
+        attachment_failure: Mutex<u8>,
+        details_calls: Mutex<usize>,
+        attachments: Mutex<Vec<(TutanotaFile, Vec<u8>)>>,
     }
 
     impl MockBackend {
@@ -1998,6 +1981,9 @@ mod tests {
                 sent: Mutex::new(Vec::new()),
                 moved: Mutex::new(Vec::new()),
                 fail_details: Mutex::new(false),
+                attachment_failure: Mutex::new(0),
+                details_calls: Mutex::new(0),
+                attachments: Mutex::new(Vec::new()),
             }
         }
 
@@ -2127,6 +2113,167 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attachment_failure_never_publishes_a_partial_message_after_restart() {
+        use crate::sync::{load_cached_folder, mail_to_metadata, prefetch_details};
+        use crypto_primitives::{aes::Aes256Key, key::GenericAesKey};
+        for prefetch in [false, true] {
+            for with_body in [false, true] {
+                for failure in [1, 2, 3] {
+                    let path = std::env::temp_dir()
+                        .join(format!("tutabridge-completeness-{}", rand::random::<u64>()));
+                    let key = GenericAesKey::Aes256(Aes256Key::from_bytes(&[19; 32]).unwrap());
+                    let open = || {
+                        Arc::new(
+                            LocalStore::open(
+                                &path.join("cache.db"),
+                                &path.join("mails"),
+                                key.clone(),
+                            )
+                            .unwrap(),
+                        )
+                    };
+                    let local = open();
+                    let mut mail = make_mail("attachment-mail", "test", false);
+                    let file_id = IdTupleGenerated::new(test_id("files"), test_id("file"));
+                    mail.attachments.push(file_id.clone());
+                    local
+                        .upsert_mail_metadata(&mail_to_metadata(&mail, "inbox", 1))
+                        .unwrap();
+                    let backend = Arc::new(MockBackend::with_mails(vec![mail.clone()]));
+                    if with_body {
+                        backend.add_details("attachment-mail", make_details("body"));
+                    }
+                    *backend.attachment_failure.lock().unwrap() = failure;
+                    backend.attachments.lock().unwrap().push((
+                        TutanotaFile {
+                            _id: Some(file_id),
+                            _permissions: test_id("permissions"),
+                            _format: 0,
+                            _ownerEncSessionKey: None,
+                            name: "complete.txt".into(),
+                            size: 7,
+                            mimeType: Some("text/plain".into()),
+                            _ownerGroup: None,
+                            cid: None,
+                            _ownerKeyVersion: None,
+                            _kdfNonce: None,
+                            parent: None,
+                            subFiles: None,
+                            blobs: vec![],
+                            _errors: Default::default(),
+                        },
+                        b"payload".to_vec(),
+                    ));
+                    let store = MailStore::new();
+                    store.set_folder_list(vec![inbox_folder()]).await;
+                    load_cached_folder(&store, &local, &inbox_folder())
+                        .await
+                        .unwrap();
+                    if prefetch {
+                        let mut retries = Default::default();
+                        prefetch_details(
+                            &store,
+                            &local,
+                            backend.as_ref(),
+                            &inbox_folder(),
+                            0,
+                            &mut retries,
+                        )
+                        .await;
+                        let calls = *backend.details_calls.lock().unwrap();
+                        prefetch_details(
+                            &store,
+                            &local,
+                            backend.as_ref(),
+                            &inbox_folder(),
+                            0,
+                            &mut retries,
+                        )
+                        .await;
+                        assert_eq!(
+                            *backend.details_calls.lock().unwrap(),
+                            calls,
+                            "immediate sweeps must not retry failed attachments"
+                        );
+                    } else {
+                        let mut session = ImapSession::new(
+                            store.clone(),
+                            backend.clone(),
+                            None,
+                            Some(local.clone()),
+                        );
+                        session.handle_command("a LOGIN u p").await;
+                        session.handle_command("b SELECT INBOX").await;
+                        let response = session.handle_command("c UID FETCH 1 (BODY.PEEK[])").await;
+                        assert!(response.last().unwrap().contains("NO [UNAVAILABLE]"));
+                        assert!(!response.iter().any(|line| line.starts_with("* 1 FETCH")));
+                        assert!(store.body_fetch_on_cooldown("attachment-mail"));
+                        // Listing still works while the complete message is unavailable.
+                        let headers = session
+                            .handle_command("d UID FETCH 1 (FLAGS ENVELOPE)")
+                            .await;
+                        assert!(headers.last().unwrap().contains("OK"));
+                    }
+                    assert!(
+                        !local.has_eml("attachment-mail"),
+                        "failed attachment must not persist a final eml"
+                    );
+                    assert!(store.get_body("attachment-mail").await.is_none());
+                    assert!(!store.get_folder("inbox").await[0].body_loaded);
+                    assert!(!local.load_folder_metadata("inbox").unwrap()[0].has_details);
+                    drop(store);
+                    drop(local);
+
+                    // A new store and database handle must not discover a fake complete body.
+                    let local = open();
+                    let store = MailStore::new();
+                    store.set_folder_list(vec![inbox_folder()]).await;
+                    load_cached_folder(&store, &local, &inbox_folder())
+                        .await
+                        .unwrap();
+                    let row = &store.get_folder("inbox").await[0];
+                    assert!(!row.body_loaded);
+                    assert_eq!(row.uid, 1);
+                    *backend.attachment_failure.lock().unwrap() = 0;
+                    if prefetch {
+                        prefetch_details(
+                            &store,
+                            &local,
+                            backend.as_ref(),
+                            &inbox_folder(),
+                            0,
+                            &mut Default::default(),
+                        )
+                        .await;
+                    }
+                    let mut session =
+                        ImapSession::new(store.clone(), backend.clone(), None, Some(local.clone()));
+                    session.handle_command("a LOGIN u p").await;
+                    session.handle_command("b SELECT INBOX").await;
+                    let response = session
+                        .handle_command("c UID FETCH 1 (BODY.PEEK[])")
+                        .await
+                        .join("");
+                    assert!(response.contains("c OK"));
+                    assert!(response.contains("complete.txt"));
+                    let rfc = local.read_eml("attachment-mail").unwrap().unwrap();
+                    assert!(rfc.contains("complete.txt"));
+                    assert!(
+                        rfc.contains("cGF5bG9hZA=="),
+                        "the complete payload must be persisted"
+                    );
+                    assert!(store.get_folder("inbox").await[0].body_loaded);
+                    assert!(local.load_folder_metadata("inbox").unwrap()[0].has_details);
+                    drop(session);
+                    drop(store);
+                    drop(local);
+                    std::fs::remove_dir_all(path).unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn copy_is_rejected() {
         let backend = Arc::new(MockBackend::with_mails(vec![]));
         let (_store, mut session) = make_session(backend).await;
@@ -2249,6 +2396,7 @@ mod tests {
             Ok(None)
         }
         async fn load_mail_details(&self, mail: &Mail) -> Result<Option<MailDetails>, String> {
+            *self.details_calls.lock().unwrap() += 1;
             if *self.fail_details.lock().unwrap() {
                 return Err("simulated Too Many Requests".to_string());
             }
@@ -2267,11 +2415,21 @@ mod tests {
                 tutasdk::entities::generated::tutanota::TutanotaFile,
                 Vec<u8>,
             )>,
-            String,
+            tutabridge_tuta::mail::AttachmentError,
         > {
-            // The mock has no attachment fixtures; the IMAP-session tests
-            // only exercise body/header paths.
-            Ok(Vec::new())
+            use tutabridge_tuta::mail::{AttachmentError, ContractError};
+            match *self.attachment_failure.lock().unwrap() {
+                1 => Err(ContractError::KeyUnavailable.into()),
+                2 => Err(AttachmentError::Transport(
+                    tutasdk::ApiCallError::RestClient {
+                        source: tutasdk::bindings::rest_client::RestClientError::NetworkError,
+                    },
+                )),
+                3 => Err(AttachmentError::Indeterminate(
+                    tutasdk::ApiCallError::internal("test".into()),
+                )),
+                _ => Ok(self.attachments.lock().unwrap().clone()),
+            }
         }
         async fn list_folders(&self) -> Result<Vec<FolderInfo>, String> {
             Ok(vec![inbox_folder()])

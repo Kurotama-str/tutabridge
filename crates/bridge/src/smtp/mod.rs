@@ -688,7 +688,7 @@ mod tests {
         async fn load_attachments(
             &self,
             _m: &Mail,
-        ) -> Result<Vec<(TutanotaFile, Vec<u8>)>, String> {
+        ) -> Result<Vec<(TutanotaFile, Vec<u8>)>, tutabridge_tuta::mail::AttachmentError> {
             unimplemented!()
         }
         async fn list_folders(&self) -> Result<Vec<FolderInfo>, String> {

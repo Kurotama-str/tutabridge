@@ -2,17 +2,21 @@
 //! to any folder, the bodies of received mails and drafts, attachments, and
 //! entities that arrive inline in event bus messages.
 use crate::folder_system::FolderSystem;
+use crypto_primitives::key::GenericAesKey;
 use crypto_primitives::randomizer_facade::RandomizerFacade;
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tutasdk::crypto::crypto_facade::ResolvedSessionKey;
+use tutasdk::crypto::crypto_facade::{BucketKeyError, ResolvedSessionKey};
 use tutasdk::entities::generated::tutanota::{
     Mail, MailBox, MailDetails, MailDetailsBlob, MailDetailsDraft, MailSet, MoveMailData,
     TutanotaFile,
 };
 use tutasdk::entities::{
-    entity_facade::{has_kdf_nonce, EntityDecryptionRequirements, EntityFacade, EntityFacadeImpl},
+    entity_facade::{
+        has_kdf_nonce, has_owner_enc_session_key, list_element_id, owner_group,
+        EntityDecryptionRequirements, EntityFacade, EntityFacadeImpl,
+    },
     Entity,
 };
 use tutasdk::services::generated::tutanota::MoveMailService;
@@ -29,6 +33,81 @@ enum BodySource<'a> {
     Blob(&'a IdTupleGenerated),
     /// A `MailDetailsDraft` list element (draft).
     Draft(&'a IdTupleGenerated),
+}
+
+/// Why a mail's attachments could not be loaded. The bridge decides what to
+/// do on the class, never on the text.
+#[derive(Debug, thiserror::Error)]
+pub enum AttachmentError {
+    /// A deterministic refusal: retrying cannot help.
+    #[error("{0}")]
+    Contract(#[from] ContractError),
+    /// Transport or server availability, as the SDK typed it; the bridge may
+    /// retry. The cause stays typed inside; the message is a fixed class.
+    #[error("the attachment could not be fetched from the server")]
+    Transport(ApiCallError),
+    /// A failure the SDK reduced to text (key loading, session keys,
+    /// decryption, internal errors): no claim about permanence is made, and
+    /// the text, which may name instances, is not the message.
+    #[error("the attachment could not be read")]
+    Indeterminate(ApiCallError),
+}
+
+/// The deterministic refusals of `MailExtensions::load_attachments`. The
+/// messages name the case, never an instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ContractError {
+    #[error("a loaded File is not one of the mail's attachments")]
+    NotInMailAttachments,
+    #[error("the server did not return every requested File")]
+    IncompleteBatch,
+    #[error("a File was returned or referenced twice")]
+    DuplicateInBatch,
+    #[error("the server returned a File from another list")]
+    WrongList,
+    #[error("the File has no key of its own and the mail carries no bucket")]
+    KeyUnavailable,
+    #[error("the mail's bucket has no entry for the File")]
+    NoBucketEntry,
+    #[error("the mail's bucket has more than one entry for the File")]
+    AmbiguousBucketEntries,
+    #[error("the mail's bucket uses a group reference, which is not supported")]
+    GroupReferenceUnsupported,
+    #[error("the File and the mail belong to different groups; the bucket path supports one")]
+    UnsupportedGroupContext,
+}
+
+/// Transport errors keep their SDK type; everything the SDK reduced to text
+/// is indeterminate.
+fn classify(error: ApiCallError) -> AttachmentError {
+    match error {
+        ApiCallError::RestClient { .. } | ApiCallError::ServerResponseError { .. } => {
+            AttachmentError::Transport(error)
+        }
+        ApiCallError::InternalSdkError { .. } => AttachmentError::Indeterminate(error),
+    }
+}
+
+fn classify_bucket(error: BucketKeyError) -> AttachmentError {
+    match error {
+        BucketKeyError::NoEntry => ContractError::NoBucketEntry.into(),
+        BucketKeyError::AmbiguousEntries => ContractError::AmbiguousBucketEntries.into(),
+        BucketKeyError::GroupReferenceUnsupported => {
+            ContractError::GroupReferenceUnsupported.into()
+        }
+        BucketKeyError::Resolution(error) => {
+            AttachmentError::Indeterminate(ApiCallError::internal(error.to_string()))
+        }
+    }
+}
+
+fn indeterminate(message: &str) -> AttachmentError {
+    AttachmentError::Indeterminate(ApiCallError::internal(message.to_owned()))
+}
+
+/// `IdTupleGenerated` is not hashable; its parts are.
+fn pair(id: &IdTupleGenerated) -> (GeneratedId, GeneratedId) {
+    (id.list_id.clone(), id.element_id.clone())
 }
 
 /// Mail operations for a logged-in session.
@@ -216,22 +295,149 @@ impl MailExtensions {
         Ok(draft.details)
     }
 
-    /// Downloads the blobs of a file attachment, decrypts them and returns the
-    /// file's bytes. Mirrors TS `BlobFacade.downloadAndDecrypt` for
-    /// attachments. `file` is the decrypted `TutanotaFile` referenced from
-    /// `Mail::attachments`; it carries the session key.
+    /// Loads the attachments of `mail`, decrypted and downloaded, as TS
+    /// `MailFacade.loadAttachments`: one request per list, the response
+    /// checked against the request, then each File decrypted with its own
+    /// key when it has one, else with the key the mail's bucket names for it
+    /// (`CryptoFacade::resolve_bucket_instance_keys`), else an error. All or
+    /// nothing, in the order of `mail.attachments`. Nothing is written to the
+    /// server; the keys live for the call. Each returned File carries the
+    /// envelope of its blob key, wrapped for the mail's group on the bucket path.
+    pub async fn load_attachments(
+        &self,
+        mail: &Mail,
+    ) -> Result<Vec<(TutanotaFile, Vec<u8>)>, AttachmentError> {
+        if mail.attachments.is_empty() {
+            return Ok(Vec::new());
+        }
+        let type_ref = TutanotaFile::type_ref();
+        let client = self.sdk.get_entity_client();
+        let model = client
+            .resolve_server_type_ref(&type_ref)
+            .map_err(AttachmentError::Indeterminate)?;
+
+        // One request per list; a File referenced twice is refused up front.
+        let mut lists: Vec<(GeneratedId, Vec<GeneratedId>)> = Vec::new();
+        for id in &mail.attachments {
+            match lists.iter_mut().find(|(list, _)| *list == id.list_id) {
+                Some((_, elements)) if elements.contains(&id.element_id) => {
+                    return Err(ContractError::DuplicateInBatch.into());
+                }
+                Some((_, elements)) => elements.push(id.element_id.clone()),
+                None => lists.push((id.list_id.clone(), vec![id.element_id.clone()])),
+            }
+        }
+        let mut parsed_files = HashMap::with_capacity(mail.attachments.len());
+        for (list, elements) in &lists {
+            let loaded = client
+                .load_multiple(&type_ref, list, elements)
+                .await
+                .map_err(classify)?;
+            for parsed in loaded {
+                let id = list_element_id(&model, &parsed)
+                    .ok_or_else(|| indeterminate("a loaded File has no id"))?;
+                if id.list_id != *list {
+                    return Err(ContractError::WrongList.into());
+                }
+                if !elements.contains(&id.element_id) {
+                    return Err(ContractError::NotInMailAttachments.into());
+                }
+                if parsed_files.insert(pair(&id), parsed).is_some() {
+                    return Err(ContractError::DuplicateInBatch.into());
+                }
+            }
+        }
+        if mail
+            .attachments
+            .iter()
+            .any(|id| !parsed_files.contains_key(&pair(id)))
+        {
+            return Err(ContractError::IncompleteBatch.into());
+        }
+
+        // Every key before any decryption: a File's own key first, the
+        // bucket for the others, in one call.
+        let crypto_client = self.sdk.mail_facade().get_crypto_entity_client();
+        let crypto = crypto_client.get_crypto_facade();
+        let mut keys: HashMap<(GeneratedId, GeneratedId), ResolvedSessionKey> = HashMap::new();
+        let mut from_bucket: Vec<IdTupleGenerated> = Vec::new();
+        for id in &mail.attachments {
+            let parsed = &parsed_files[&pair(id)];
+            if has_owner_enc_session_key(&model, parsed) {
+                let key = crypto
+                    .resolve_session_key(parsed, &model)
+                    .await
+                    .map_err(|e| indeterminate(&format!("File session key: {e}")))?
+                    .ok_or_else(|| indeterminate("File is encrypted but resolved no key"))?;
+                keys.insert(pair(id), key);
+            } else {
+                from_bucket.push(id.clone());
+            }
+        }
+        if !from_bucket.is_empty() {
+            let Some(bucket) = mail.bucketKey.as_ref() else {
+                return Err(ContractError::KeyUnavailable.into());
+            };
+            let Some(mail_group) = mail._ownerGroup.as_ref() else {
+                return Err(indeterminate("Mail missing _ownerGroup"));
+            };
+            // The bucket path wraps keys for the mail's group: a File of
+            // another group is a profile this fix does not cover.
+            if from_bucket.iter().any(|id| {
+                owner_group(&model, &parsed_files[&pair(id)]).as_ref() != Some(mail_group)
+            }) {
+                return Err(ContractError::UnsupportedGroupContext.into());
+            }
+            let resolved = crypto
+                .resolve_bucket_instance_keys(bucket, mail_group, &from_bucket)
+                .await
+                .map_err(classify_bucket)?;
+            keys.extend(from_bucket.iter().map(pair).zip(resolved));
+        }
+
+        let mut out = Vec::with_capacity(mail.attachments.len());
+        for id in &mail.attachments {
+            let parsed = parsed_files
+                .remove(&pair(id))
+                .expect("every attachment was loaded");
+            let key = keys.remove(&pair(id)).expect("every attachment has a key");
+            let decrypted = crypto_client
+                .decrypt_parsed(&type_ref, parsed, Some(key.clone()))
+                .await
+                .map_err(classify)?;
+            let mut file: TutanotaFile = self
+                .sdk
+                .instance_mapper
+                .parse_entity(decrypted)
+                .map_err(|e| indeterminate(&format!("Failed to map File: {e}")))?;
+            if !file._errors.is_empty() {
+                return Err(indeterminate("File metadata did not decrypt"));
+            }
+            // Group-key AEAD attributes need no session key in the entity
+            // decoder, but the returned File must retain the blob key envelope.
+            file._ownerKeyVersion = Some(
+                i64::try_from(key.owner_key_version)
+                    .map_err(|_| indeterminate("File key version is out of range"))?,
+            );
+            file._ownerEncSessionKey = Some(key.owner_enc_session_key);
+            let data = self
+                .load_file_attachment_data(&file, &key.session_key)
+                .await
+                .map_err(classify)?;
+            out.push((file, data));
+        }
+        Ok(out)
+    }
+
+    /// Downloads the blobs of a file attachment, decrypts them with `key`,
+    /// the File's session key, and returns the file's bytes. Mirrors TS
+    /// `BlobFacade.downloadAndDecrypt` for attachments. `file` is the
+    /// decrypted `TutanotaFile` referenced from `Mail::attachments`.
     pub async fn load_file_attachment_data(
         &self,
         file: &TutanotaFile,
+        key: &GenericAesKey,
     ) -> Result<Vec<u8>, ApiCallError> {
-        let key = self
-            .owner_key(
-                "File",
-                file._ownerGroup.as_ref(),
-                file._ownerEncSessionKey.as_ref(),
-                file._ownerKeyVersion,
-            )
-            .await?;
         if file.blobs.is_empty() {
             return Ok(Vec::new());
         }
@@ -254,7 +460,7 @@ impl MailExtensions {
                 .download_blobs(&archive, instance, ArchiveDataType::Attachments, &ids)
                 .await?;
             for (id, bytes) in encrypted {
-                let data = key.session_key.decrypt_data(&bytes).map_err(|e| {
+                let data = key.decrypt_data(&bytes).map_err(|e| {
                     ApiCallError::internal(format!("Cannot decrypt attachment blob {id}: {e}"))
                 })?;
                 chunks.insert((archive.clone(), id), data);
@@ -279,10 +485,10 @@ impl MailExtensions {
     /// message instead of being loaded over REST, as TS
     /// `getParsedInstanceFromEntityEvent` does.
     ///
-    /// Returns `Ok(None)` when the session key cannot be resolved yet, which
-    /// happens for example after a reply, before the attachments'
-    /// `_ownerEncSessionKey` is propagated; the caller then reloads the
-    /// entity over REST.
+    /// Returns `Ok(None)` when no session key can be resolved from the
+    /// payload itself. The caller may load the entity over REST instead:
+    /// another attempt under the same resolution rules, not a wait for the
+    /// server to add a key, which no server-side process does.
     pub async fn decrypt_inline_and_parse<T: Entity + DeserializeOwned>(
         &self,
         json: &str,

@@ -959,8 +959,12 @@ mod startup_tests {
         async fn load_attachments(
             &self,
             _m: &Mail,
-        ) -> Result<Vec<(TutanotaFile, Vec<u8>)>, String> {
-            Err("offline".into())
+        ) -> Result<Vec<(TutanotaFile, Vec<u8>)>, tutabridge_tuta::mail::AttachmentError> {
+            Err(tutabridge_tuta::mail::AttachmentError::Transport(
+                tutasdk::ApiCallError::RestClient {
+                    source: tutasdk::bindings::rest_client::RestClientError::NetworkError,
+                },
+            ))
         }
         async fn list_folders(&self) -> Result<Vec<FolderInfo>, String> {
             Ok(vec![folder()])

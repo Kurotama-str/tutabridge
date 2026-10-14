@@ -85,7 +85,10 @@ pub trait MailBackend: Send + Sync {
     /// `mail.attachments`. Empty if the mail has no attachments. Errors are
     /// per-mail (no partial returns): if any one attachment fails the whole
     /// call returns `Err` so the caller can decide to retry the prefetch.
-    async fn load_attachments(&self, mail: &Mail) -> Result<Vec<(TutanotaFile, Vec<u8>)>, String>;
+    async fn load_attachments(
+        &self,
+        mail: &Mail,
+    ) -> Result<Vec<(TutanotaFile, Vec<u8>)>, tutabridge_tuta::mail::AttachmentError>;
     /// Enumerate all mail folders (system + custom, with hierarchy).
     async fn list_folders(&self) -> Result<Vec<FolderInfo>, String>;
     async fn set_unread_status(
@@ -388,76 +391,18 @@ impl TutaSession {
     async fn load_attachments_impl(
         &self,
         mail: &Mail,
-    ) -> Result<Vec<(TutanotaFile, Vec<u8>)>, ApiCallError> {
+    ) -> Result<Vec<(TutanotaFile, Vec<u8>)>, tutabridge_tuta::mail::AttachmentError> {
         if mail.attachments.is_empty() {
             return Ok(Vec::new());
         }
-        // Fast path: an inbox copy of a self-sent mail. The server never
-        // populates its File entities' `_ownerEncSessionKey`, but we still
-        // hold the plaintext bytes we passed to SMTP — return them and
-        // skip the REST round-trip entirely.
         if let Some(cached) = self.try_self_send_cache(mail).await {
-            return Ok(cached);
-        }
-        let mail_facade = MailExtensions::new(self.logged_in.clone());
-        let mut out: Vec<(TutanotaFile, Vec<u8>)> = Vec::with_capacity(mail.attachments.len());
-        for file_id in &mail.attachments {
-            let file = self.load_file_with_retry(file_id).await?;
-            let data = mail_facade.load_file_attachment_data(&file).await?;
-            out.push((file, data));
-        }
-        Ok(out)
-    }
-
-    /// Load a `TutanotaFile` entity, retrying with backoff when the server
-    /// returns it before its encryption metadata has propagated.
-    ///
-    /// Mails delivered through the realtime event bus typically include
-    /// freshly-created attachments whose `_ownerEncSessionKey` /
-    /// `_ownerGroup` haven't been published yet — the SDK's session-key
-    /// resolution then fails with "instance missing owner key/group data".
-    /// 2s + 4s + 8s + 16s ≈ 30s of tolerance covers the propagation lag in
-    /// practice (self-sends can take >20s because the same mailbox
-    /// produces both the Sent entity and the Inbox copy); anything still
-    /// failing after that bubbles up so the `prefetch_details` caller can
-    /// decide to ship a body-only envelope and let the next prefetch
-    /// sweep (triggered by another store mutation) take another shot.
-    async fn load_file_with_retry(
-        &self,
-        file_id: &IdTupleGenerated,
-    ) -> Result<TutanotaFile, ApiCallError> {
-        let crypto_client = self.crypto_client();
-        let backoffs = [
-            std::time::Duration::from_secs(2),
-            std::time::Duration::from_secs(4),
-            std::time::Duration::from_secs(8),
-            std::time::Duration::from_secs(16),
-        ];
-        let mut iter = backoffs.iter();
-        loop {
-            match crypto_client.load::<TutanotaFile, _>(file_id).await {
-                Ok(file) => return Ok(file),
-                Err(e) if is_session_key_transient(&e) => match iter.next() {
-                    Some(delay) => {
-                        log::debug!(
-                            "File {} not yet decryptable, retrying in {:?}",
-                            file_id.element_id,
-                            delay
-                        );
-                        tokio::time::sleep(*delay).await;
-                        continue;
-                    }
-                    None => {
-                        log::warn!(
-                            "File {} still not decryptable after retries",
-                            file_id.element_id
-                        );
-                        return Err(e);
-                    }
-                },
-                Err(e) => return Err(e),
+            if cached.len() == mail.attachments.len() {
+                return Ok(cached);
             }
         }
+        MailExtensions::new(self.logged_in.clone())
+            .load_attachments(mail)
+            .await
     }
 
     /// Encrypt + upload every attachment in one go, then assemble the
@@ -1046,10 +991,11 @@ impl MailBackend for TutaSession {
             .map_err(|e| format!("{e}"))
     }
 
-    async fn load_attachments(&self, mail: &Mail) -> Result<Vec<(TutanotaFile, Vec<u8>)>, String> {
-        self.load_attachments_impl(mail)
-            .await
-            .map_err(|e| format!("{e}"))
+    async fn load_attachments(
+        &self,
+        mail: &Mail,
+    ) -> Result<Vec<(TutanotaFile, Vec<u8>)>, tutabridge_tuta::mail::AttachmentError> {
+        self.load_attachments_impl(mail).await
     }
 
     async fn list_folders(&self) -> Result<Vec<FolderInfo>, String> {
@@ -1527,23 +1473,6 @@ pub(crate) fn plaintext_to_tuta_html(text: &str) -> String {
         .replace('\r', "<br>")
 }
 
-/// Recognise the SDK error shape that means "the server returned the entity
-/// but its `_ownerEncSessionKey` / `_ownerGroup` are not populated yet".
-/// Newly-created mail attachments hit this for a few seconds after the
-/// `SendDraftService` round-trip — the WS push beats the encryption-metadata
-/// propagation. The exact wording comes from `CryptoFacade::resolve_session_key`
-/// in the Rust SDK; matching on the substring keeps us decoupled from the
-/// variant tree.
-fn is_session_key_transient(e: &ApiCallError) -> bool {
-    match e {
-        ApiCallError::InternalSdkError { error_message } => {
-            error_message.contains("missing owner key/group data")
-                || error_message.contains("Session key resolution failure")
-        }
-        _ => false,
-    }
-}
-
 /// Build a random 4-byte `CustomId` — used for `_id` on aggregates that
 /// declare `cardinality: One`. Server never reads the value.
 fn random_custom_id(randomizer: &RandomizerFacade) -> CustomId {
@@ -1797,46 +1726,6 @@ mod self_send_cache_tests {
             &msg("Me@Tuta.IO", "ME@tuta.io", "case"),
             "me@tuta.io"
         ));
-    }
-}
-
-#[cfg(test)]
-mod transient_tests {
-    use super::*;
-
-    #[test]
-    fn missing_owner_key_is_transient() {
-        let e = ApiCallError::InternalSdkError {
-            error_message: "Failed to resolve session key for entity 'File' with ID: ...; \
-                Session key resolution failure: instance missing owner key/group data"
-                .to_string(),
-        };
-        assert!(is_session_key_transient(&e));
-    }
-
-    #[test]
-    fn generic_session_key_failure_is_transient() {
-        let e = ApiCallError::InternalSdkError {
-            error_message: "Session key resolution failure: weird reason".to_string(),
-        };
-        assert!(is_session_key_transient(&e));
-    }
-
-    #[test]
-    fn other_internal_errors_are_not_transient() {
-        let e = ApiCallError::InternalSdkError {
-            error_message: "Failed to parse blob response: bad JSON".to_string(),
-        };
-        assert!(!is_session_key_transient(&e));
-    }
-
-    #[test]
-    fn server_errors_are_not_transient() {
-        let e = ApiCallError::InternalSdkError {
-            error_message: "missing owner key/group data".to_string(),
-        };
-        // We only retry session-key resolution; other shapes pass through.
-        assert!(is_session_key_transient(&e));
     }
 }
 
