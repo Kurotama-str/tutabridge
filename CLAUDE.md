@@ -70,3 +70,9 @@ Generated, never edited: the official Tuta release in `sdk/BASE` plus
 pin, CI runs it). A weekly workflow (`sdk-bump.yml`) opens the PR that
 moves to Tuta's latest release. Bridge-specific SDK extensions live in
 `crates/tuta`. See `docs/SDK_PATCHES.md`.
+
+## In-app updates
+
+The GUI checks signed GitHub updates; users can disable automatic checks in
+settings. The CLI never updates itself. Keep the updater signing key and
+password backed up: installed apps trust the public key in tauri.conf.json.

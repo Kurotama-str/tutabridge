@@ -2,6 +2,7 @@
 
 mod commands;
 mod tray;
+mod update;
 
 use commands::BridgeState;
 use std::sync::Arc;
@@ -34,6 +35,7 @@ fn main() {
         }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(shared as BridgeState)
         .manage(commands::TotpState(std::sync::Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
@@ -49,8 +51,14 @@ fn main() {
             commands::regenerate_bridge_password,
             commands::export_mails,
             commands::get_mcp_client_config,
+            update::check_update,
+            update::install_update,
+            update::get_app_version,
+            update::pending_update,
+            update::restart_app,
         ])
         .setup(|app| {
+            log::info!("TutaBridge {} starting", app.package_info().version);
             create_main_window(app)?;
             if let Err(error) = tray::setup(app) {
                 log::warn!("Tray unavailable; closing the window will exit: {error}");
@@ -60,6 +68,8 @@ fn main() {
             tauri::async_runtime::spawn(async move {
                 stream_logs(app_handle, log_rx).await;
             });
+
+            tauri::async_runtime::spawn(update::run(app.handle().clone()));
 
             let app_handle = app.handle().clone();
             let stats_state = app.state::<BridgeState>().inner().clone();

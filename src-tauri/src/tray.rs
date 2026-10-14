@@ -4,14 +4,25 @@ use tauri::{
     App, AppHandle, Manager, Window, WindowEvent,
 };
 
+struct UpdateMenu(MenuItem<tauri::Wry>);
+
 const TRAY_ID: &str = "main-tray";
 
 pub fn setup(app: &App) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "tray-open", "Open TutaBridge", true, None::<&str>)?;
     let hide = MenuItem::with_id(app, "tray-hide", "Hide to tray", true, None::<&str>)?;
+    let restart = MenuItem::with_id(
+        app,
+        "tray-restart",
+        "No update pending",
+        false,
+        None::<&str>,
+    )?;
     let quit = MenuItem::with_id(app, "tray-quit", "Quit TutaBridge", true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
-    let menu = Menu::with_items(app, &[&open, &hide, &separator, &quit])?;
+    let menu = Menu::with_items(app, &[&open, &hide, &restart, &separator, &quit])?;
+
+    app.manage(UpdateMenu(restart));
 
     TrayIconBuilder::with_id(TRAY_ID)
         .icon(
@@ -34,6 +45,7 @@ pub fn setup(app: &App) -> tauri::Result<()> {
             }
             // Explicit Quit (and the native macOS Quit command) still exits.
             "tray-quit" => app.exit(0),
+            "tray-restart" => app.restart(),
             _ => {}
         })
         .build(app)?;
@@ -93,4 +105,16 @@ fn tray_host_available() -> bool {
             "IsStatusNotifierHostRegistered",
         )
         .unwrap_or(false)
+}
+
+pub fn update_ready(app: &AppHandle) {
+    if let Some(item) = app.try_state::<UpdateMenu>() {
+        let result = item
+            .0
+            .set_text("Restart to update")
+            .and_then(|()| item.0.set_enabled(true));
+        if let Err(error) = result {
+            log::warn!("Could not update tray menu: {error}");
+        }
+    }
 }
