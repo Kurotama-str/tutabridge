@@ -67,8 +67,9 @@ panics at startup next to the bridge's own logger.
 
 Generated, never edited: the official Tuta release in `sdk/BASE` plus
 `sdk/patches/`, built by `scripts/sdk-generate.sh` (`--check` verifies the
-pin, CI runs it). A weekly workflow (`sdk-bump.yml`) opens the PR that
-moves to Tuta's latest release. Bridge-specific SDK extensions live in
+pin, CI runs it). Every two weeks `sdk-bump.yml` selects Tuta's latest release, verifies
+the patches, tests the exact bridge candidate, integrates it and calls
+the signed release workflow. Bridge-specific SDK extensions live in
 `crates/tuta`. See `docs/SDK_PATCHES.md`.
 
 ## In-app updates

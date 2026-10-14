@@ -1,23 +1,66 @@
 name: Release
 
-# Two ways in:
-#   * push a tag `v0.1.0`  → build installers and attach them to a draft
-#     GitHub Release.
-#   * run manually (workflow_dispatch, on any branch) → build the same
-#     installers and upload them as **workflow artifacts** only, with no tag
-#     and no release. This is how you test the pipeline without burning a tag.
+# Manual runs are previews. Production publication is called explicitly by
+# sdk-bump after exact-source CI and integration; token pushes need no chaining.
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      ref:
+        description: "Source commit (empty uses this branch)"
+        required: false
+      version:
+        description: "Preview version, X.Y.Z-rc.N"
+        default: "0.1.0-rc.0"
+        required: true
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: true
+      version:
+        type: string
+        required: true
+      publish:
+        type: boolean
+        default: false
+    secrets:
+      TAURI_SIGNING_PRIVATE_KEY:
+        required: false
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD:
+        required: false
 
+concurrency:
+  group: release-publication
+  cancel-in-progress: false
+permissions:
+  contents: read
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  release:
-    permissions:
-      contents: write # create the release + upload assets (tag runs only)
+  source:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: source
+        name: Resolve immutable source
+        env:
+          SOURCE_REF: ${{ inputs.ref || github.sha }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          sha=$(git rev-parse --verify "$SOURCE_REF^{commit}")
+          if [ "$PUBLISH" = true ]; then
+            git merge-base --is-ancestor "$sha" origin/main
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: source
     strategy:
       fail-fast: false
       matrix:
@@ -25,144 +68,145 @@ jobs:
           - platform: macos-latest
             rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
             tauri_args: --target universal-apple-darwin
-            cli_asset: tutabridge-macos-arm64
             bundle_path: target/universal-apple-darwin/release/bundle
           - platform: ubuntu-latest
             rust_targets: ""
             tauri_args: ""
-            cli_asset: tutabridge-linux-x86_64
             bundle_path: target/release/bundle
           - platform: windows-latest
             rust_targets: ""
             tauri_args: ""
-            cli_asset: tutabridge-windows-x86_64.exe
             bundle_path: target/release/bundle
     runs-on: ${{ matrix.platform }}
     steps:
-      - name: Checkout (with vendored SDK submodule)
+      - name: Checkout release tooling
         uses: actions/checkout@v4
         with:
+          path: automation
+          persist-credentials: false
+      - name: Checkout exact build source
+        uses: actions/checkout@v4
+        with:
+          path: source
+          ref: ${{ needs.source.outputs.sha }}
           submodules: recursive
           fetch-depth: 0
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust_targets }}
-
-      - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: ui/package-lock.json
-
-      # Linux: Tauri's webkit/gtk stack + our build deps (aws-lc-sys, the
-      # keyring Secret Service backend's libdbus).
+          node-version: 22
       - name: Install Linux deps
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libgtk-3-dev \
-            librsvg2-dev \
-            libsoup-3.0-dev \
-            libjavascriptcoregtk-4.1-dev \
-            libayatana-appindicator3-dev \
-            cmake nasm libdbus-1-dev pkg-config
-
-      # Windows: NASM for aws-lc-sys's assembly.
-      - name: Install NASM (Windows)
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libayatana-appindicator3-dev cmake nasm libdbus-1-dev pkg-config
+      - name: Install NASM
         if: runner.os == 'Windows'
         uses: ilammy/setup-nasm@v1
-
-      - name: Install frontend deps
-        working-directory: ui
-        run: npm ci
-
-      # Builds the GUI bundles (.dmg / .msi+.exe / .deb+.AppImage). On a tag it
-      # also creates/updates a draft Release and uploads them; on a manual run
-      # `tagName` is empty so it only builds (no release).
-      - name: Build GUI bundles
-        id: tauri
-        uses: tauri-apps/tauri-action@v0
+      - name: Install frontend and pinned bundler
+        working-directory: source/ui
+        run: |
+          npm ci
+          npm install --global @tauri-apps/cli@2.11.2
+      - name: Set version without updater signing in the build job
+        working-directory: source
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
-          releaseName: ${{ startsWith(github.ref, 'refs/tags/') && format('TutaBridge {0}', github.ref_name) || '' }}
-          releaseDraft: true
-          prerelease: false
-          args: ${{ matrix.tauri_args }}
-
-      - name: Build CLI
-        run: cargo build --release -p tutabridge
-
-      # --- Tag run: attach the CLI binary to the draft release ---
-      - name: Attach CLI to release
-        if: startsWith(github.ref, 'refs/tags/')
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: python ../automation/scripts/release-assets.py prepare --version "$RELEASE_VERSION"
+        shell: bash
+      - name: Build bundles and CLI without signing credentials
+        working-directory: source
         shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_ARGS: ${{ matrix.tauri_args }}
         run: |
-          src=target/release/tutabridge
-          [ "${{ runner.os }}" = "Windows" ] && src=target/release/tutabridge.exe
-          cp "$src" "${{ matrix.cli_asset }}"
-          gh release upload "${{ github.ref_name }}" "${{ matrix.cli_asset }}" --clobber
-
-      # tauri-action names the GUI installers with the version (e.g.
-      # TutaBridge_0.1.0_universal.dmg), which would break any fixed download
-      # link on the next release. Upload version-less aliases alongside them so
-      # `releases/latest/download/TutaBridge-macOS.dmg` (and friends) always
-      # resolve to the current build. The CLI assets are already version-less.
-      - name: Attach version-less GUI installer aliases
-        if: startsWith(github.ref, 'refs/tags/')
+          args=()
+          if [ -n "$TAURI_ARGS" ]; then read -r -a args <<< "$TAURI_ARGS"; fi
+          tauri build "${args[@]}"
+          cargo build --locked --release -p tutabridge
+      - name: Prepare standard updater payloads and installers
+        working-directory: source
         shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUNDLE_PATH: ${{ matrix.bundle_path }}
+          PLATFORM: ${{ runner.os }}
+        run: python ../automation/scripts/release-assets.py collect --bundle "$BUNDLE_PATH" --platform "$PLATFORM"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-${{ runner.os }}
+          path: source/release-assets/*
+          if-no-files-found: error
+
+  sign:
+    needs: [source, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # A new runner: no SDK checkout, compilation, or restored build cache.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install pinned signer and signature verifier
         run: |
-          bp="${{ matrix.bundle_path }}"
-          tag="${{ github.ref_name }}"
-          alias() { # $1 = glob, $2 = stable name
-            f=$(ls $1 2>/dev/null | head -n1)
-            if [ -n "$f" ]; then
-              cp "$f" "$2"
-              gh release upload "$tag" "$2" --clobber
-            else
-              echo "::warning::no installer matched $1"
-            fi
-          }
-          case "${{ runner.os }}" in
-            macOS)
-              alias "$bp/dmg/*.dmg" "TutaBridge-macOS.dmg" ;;
-            Linux)
-              alias "$bp/appimage/*.AppImage" "TutaBridge-Linux.AppImage"
-              alias "$bp/deb/*.deb"           "TutaBridge-Linux.deb"
-              alias "$bp/rpm/*.rpm"           "TutaBridge-Linux.rpm" ;;
-            Windows)
-              alias "$bp/nsis/*-setup.exe" "TutaBridge-Windows-setup.exe"
-              alias "$bp/msi/*.msi"        "TutaBridge-Windows.msi" ;;
-          esac
-
-      # --- Manual run: publish everything as downloadable workflow artifacts ---
-      - name: Upload GUI bundles as artifacts
-        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          npm install --global @tauri-apps/cli@2.11.2
+          sudo apt-get update && sudo apt-get install -y minisign
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: unsigned-*
+          path: release-assets
+          merge-multiple: true
+      - name: Prepare preview key
+        if: ${{ !inputs.publish }}
+        run: |
+          tauri signer generate --ci --password '' --write-keys "$RUNNER_TEMP/preview.key" > /dev/null
+          cp "$RUNNER_TEMP/preview.key.pub" "$RUNNER_TEMP/updater.pub"
+      - name: Read application public key
+        if: inputs.publish
+        env:
+          SOURCE: ${{ needs.source.outputs.sha }}
+        run: |
+          git show "$SOURCE:src-tauri/tauri.conf.json" > "$RUNNER_TEMP/app-config.json"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP'])
+          key = json.loads((root / 'app-config.json').read_text())['plugins']['updater']['pubkey']
+          (root / 'updater.pub').write_text(key)
+          PY
+      - name: Sign preview and validate manifest
+        if: ${{ !inputs.publish }}
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          TAURI_SIGNING_PRIVATE_KEY=$(cat "$RUNNER_TEMP/preview.key")
+          export TAURI_SIGNING_PRIVATE_KEY
+          export TAURI_SIGNING_PRIVATE_KEY_PASSWORD=''
+          python3 scripts/release-assets.py sign --version "$RELEASE_VERSION" --pubkey "$RUNNER_TEMP/updater.pub"
+      - name: Sign production and validate against the app key
+        if: inputs.publish
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: python3 scripts/release-assets.py sign --version "$RELEASE_VERSION" --pubkey "$RUNNER_TEMP/updater.pub"
+      - name: Preserve complete signed release for inspection
         uses: actions/upload-artifact@v4
         with:
-          name: gui-bundles-${{ matrix.platform }}
-          path: ${{ matrix.bundle_path }}/**
-          if-no-files-found: warn
-
-      - name: Upload CLI as artifact
-        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.cli_asset }}
-          path: |
-            target/release/tutabridge
-            target/release/tutabridge.exe
-          if-no-files-found: warn
+          name: signed-release
+          path: release-assets/*
+          if-no-files-found: error
+      - name: Publish only after all assets and signatures pass
+        if: inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          SOURCE: ${{ needs.source.outputs.sha }}
+        run: python3 scripts/release-assets.py publish --version "$RELEASE_VERSION" --source "$SOURCE" --pubkey "$RUNNER_TEMP/updater.pub"

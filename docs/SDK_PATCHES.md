@@ -36,44 +36,16 @@ scripts/sdk-generate.sh --verify-each
 ```
 
 Also checks every patch on its own: after each one, the SDK must be
-formatted and pass its tests. Slower (about 8 minutes); run it whenever a
+formatted and pass its tests. Slower; run it whenever a
 patch changes.
 
 ## Moving to a new Tuta release
 
-The `SDK bump` workflow (`.github/workflows/sdk-bump.yml`) opens the PR:
-every Monday, or on demand from the Actions tab, it looks for a
-`tutanota-release-*` tag newer than `sdk/BASE`, points `sdk/BASE` at it,
-runs `scripts/sdk-generate.sh --verify-each`, publishes the generated
-commit on the fork and pushes a `sdk/<version>` branch. When a patch no
-longer applies, the PR is opened all the same, with the generator's
-message and only `sdk/BASE` moved. The workflow needs the
-`SDK_BUMP_TOKEN` repository secret: a fine-grained token with contents and
-pull-request write access on this repository and contents write access on
-the fork. Verifying the patches runs the release's own code, which nobody
-has reviewed yet, so that job holds no token, uses no action and no cache;
-the job that pushes with the token runs git alone.
-The publish job regenerates and compares the commit with the verified one
-before pushing. Publication rejects older tags; a dry run can target any
-release, including the current one, and always runs verification.
-Runs are serialized; if a branch
-was pushed but PR creation failed, the next run opens the PR from that
-branch without rebuilding or overwriting it. Existing PRs are left alone.
-
-By hand, or to finish a PR whose patches broke:
-
-1. Put the new tag and its commit in `sdk/BASE`.
-2. `scripts/sdk-generate.sh`. A patch Tuta has taken is reported as
-   already included: delete it. A patch that no longer applies is fixed in
-   `sdk/patches/` (regenerate it with `git format-patch` from a fixed tree),
-   never in `tuta-repo`. Then `scripts/sdk-generate.sh --verify-each`.
-3. `scripts/sdk-generate.sh --push`, `git add tuta-repo sdk .gitmodules`,
-   push.
-
-Before merging any bump: CI (the SDK and bridge test suites), then a live
-check: log in, list and read mail, open a received attachment and a
-self-sent one, send one plaintext and one HTML message, mark read, move
-and trash, read the log. Then tag a release.
+The automated path is described in **Automatic releases** below. Ordinary
+bumps require no manual SDK edit or tag. If verification fails, fix or remove
+the affected patch in `sdk/patches`, test it with
+`scripts/sdk-generate.sh --verify-each`, and review that correction before
+rerunning the workflow. Do not edit the generated submodule by hand.
 
 Tuta raises the minimum client version it accepts every few months (HTTP
 474 below it), so staying on recent releases is what keeps the bridge able
@@ -115,3 +87,44 @@ version floor (#38), then @ninjapanzer rebased the commits onto the real
 359 release (#47) and documented why a relabelled version is not a real
 one. This layout replaces the fork with generated releases, so a new Tuta
 release is a new tag in `sdk/BASE`, a regeneration and a test run.
+
+
+## Automatic releases
+
+Every other Monday at 06:00 UTC (anchor: 2026-10-19), `sdk-bump.yml`
+selects the latest official Tuta release tag. The weekly cron exits on the
+alternate week before querying Tuta. A manual run bypasses the date guard.
+The GUI checks for published updates every six hours; this is a separate clock.
+
+The workflow tests every patch in a job without publication credentials,
+regenerates the same SDK commit in a fresh Git-only job, and opens a candidate
+PR. Full bridge CI runs against that exact commit. Only the expected SDK pin,
+base, submodule branch and `release-plan.json` may change. The candidate is
+integrated with a normal fast-forward only while main is still its captured
+parent. Human changes to candidate branches are never overwritten.
+
+A failed patch produces a diagnostic PR, never a merge or release. If Tuta has
+already incorporated a patch, review and remove it from `sdk/patches` before
+rerunning. Offline tests do not establish that the live Tuta service accepts
+the SDK; there is no live account test in this pipeline.
+
+`release-plan.json` records the next rc version and SDK commits. Its introducing
+commit is the immutable release source. If packaging or publication fails,
+rerunning SDK bump resumes that plan before considering a newer SDK. Builds
+run on Linux, macOS and Windows without signing keys or persisted Git credentials.
+A fresh job signs standard updater payloads, verifies them against the app's
+public key and publishes one complete `latest.json`. Published releases are
+never modified; a conflicting tag or draft stops for investigation.
+
+Secrets: `SDK_BUMP_TOKEN` can write the SDK fork and candidate PRs;
+`TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` sign updates.
+Main/tag/release writes use `GITHUB_TOKEN`, and downstream jobs are invoked
+explicitly rather than depending on token pushes to trigger workflows.
+Back up the signing key: installed apps trust its public counterpart.
+
+Validation modes: SDK bump with `dry_run=true` only regenerates/tests the SDK,
+without any push, PR or release. A manual Release run builds all platforms and
+signs with an ephemeral test key, publishing workflow artifacts only. Those
+preview signatures are intentionally not trusted by production apps.
+For a rollback, the reusable Release workflow accepts an older main commit
+with a new higher rc version; installed apps never downgrade their version.

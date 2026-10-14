@@ -4,10 +4,18 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+
+permissions:
+  contents: read
 
 # Cancel superseded runs on the same ref.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ inputs.ref || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -24,6 +32,8 @@ jobs:
         with:
           # The Tuta Rust SDK is vendored as the `tuta-repo` submodule and
           # the build does not work without it.
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
           submodules: recursive
           # Full history so the submodule's pinned commit (which lives on a
           # fork branch, not necessarily a branch tip) is always reachable —
@@ -43,14 +53,13 @@ jobs:
       # Caches ~/.cargo and ./target — the SDK + aws-lc-sys + pqcrypto are
       # heavy, so without this a run takes ~10 min.
       - name: Cache cargo build
+        if: inputs.ref == ''
         uses: Swatinem/rust-cache@v2
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
-          cache-dependency-path: ui/package-lock.json
 
       # The GUI crate's build script (tauri-build) needs the frontend bundle
       # at ui/dist, so the frontend has to be built before any cargo step
@@ -78,6 +87,9 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      - name: Test release coordination
+        run: python3 -m unittest discover -s scripts/tests -v
+
   linux-cli:
     # Proves the headless CLI + core build and test on Linux — i.e. that the
     # AUR / daemon target is buildable without the GUI's native deps
@@ -87,6 +99,8 @@ jobs:
       - name: Checkout (with vendored SDK submodule)
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
           submodules: recursive
           fetch-depth: 0
 
@@ -94,6 +108,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo build
+        if: inputs.ref == ''
         uses: Swatinem/rust-cache@v2
 
       # aws-lc-sys (rustls stack) needs cmake + nasm; libdbus-1-dev +
@@ -124,6 +139,8 @@ jobs:
       - name: Checkout (with vendored SDK submodule)
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
           submodules: recursive
           fetch-depth: 0
 
@@ -131,6 +148,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo build
+        if: inputs.ref == ''
         uses: Swatinem/rust-cache@v2
         with:
           key: desktop
@@ -149,8 +167,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
-          cache-dependency-path: ui/package-lock.json
 
       - name: Build frontend
         working-directory: ui
