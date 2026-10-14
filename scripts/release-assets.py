@@ -107,6 +107,7 @@ def manifest(directory, version, pubkey):
     for target, name in PAYLOADS.items():
         signature = (directory / (name + '.sig')).read_text().strip()
         verify_signature(directory / name, signature, pubkey)
+        print(f"Verified updater signature: {target} ({name})")
         platforms[target] = dict(signature=signature, url=f'https://github.com/{REPO}/releases/download/v{version}/{name}')
     return dict(version=app_version(version), notes=f'TutaBridge {version}',
                 pub_date=datetime.now(timezone.utc).isoformat(), platforms=platforms)

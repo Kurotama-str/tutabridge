@@ -36,7 +36,7 @@ on:
         required: false
 
 concurrency:
-  group: release-publication
+  group: ${{ inputs.publish && 'release-publication' || format('release-preview-{0}', github.run_id) }}
   cancel-in-progress: false
 permissions:
   contents: read
@@ -137,6 +137,7 @@ jobs:
         run: python ../automation/scripts/release-assets.py prepare --version "$RELEASE_VERSION"
         shell: bash
       - name: Build bundles and CLI without signing credentials
+        if: runner.os != 'Windows'
         working-directory: source
         shell: bash
         env:
@@ -145,6 +146,14 @@ jobs:
           args=()
           if [ -n "$TAURI_ARGS" ]; then read -r -a args <<< "$TAURI_ARGS"; fi
           tauri build "${args[@]}"
+          cargo build --locked --release -p tutabridge
+      - name: Build Windows bundles and CLI with native tools
+        if: runner.os == 'Windows'
+        working-directory: source
+        shell: pwsh
+        run: |
+          tauri build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo build --locked --release -p tutabridge
       - name: Prepare standard updater payloads and installers
         working-directory: source
@@ -187,6 +196,13 @@ jobs:
         run: |
           tauri signer generate --ci --password '' --write-keys "$RUNNER_TEMP/preview.key" > /dev/null
           cp "$RUNNER_TEMP/preview.key.pub" "$RUNNER_TEMP/updater.pub"
+      - name: Preserve preview public key for independent verification
+        if: ${{ !inputs.publish }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: preview-public-key
+          path: ${{ runner.temp }}/updater.pub
+          if-no-files-found: error
       - name: Read application public key
         if: inputs.publish
         env:
