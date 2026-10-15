@@ -5,6 +5,8 @@ import subprocess, signal, os, sys, time
 # Ensure terminal delivers SIGINT on Ctrl+C (zsh disables this in some configs)
 os.system("stty isig 2>/dev/null")
 
+subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts/sdk-prepare.py")], check=True)
+
 proc = subprocess.Popen(
     ["cargo", "tauri", "dev"] + sys.argv[1:],
     start_new_session=True,

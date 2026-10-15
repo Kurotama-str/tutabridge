@@ -4,3 +4,6 @@
 .DS_Store
 
 __pycache__/
+
+/sdk/generated/
+/sdk/.sdk-stage-*/

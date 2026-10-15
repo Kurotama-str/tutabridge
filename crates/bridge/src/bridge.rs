@@ -15,9 +15,9 @@ pub const CLIENT_NAME: &str = "tutabridge";
 // vendored SDK's type-model JSONs so the values track the submodule bump
 // automatically — no more hard-coded constants going stale silently.
 const SYS_TYPE_MODELS_JSON: &str =
-    include_str!("../../../tuta-repo/tuta-sdk/rust/sdk/src/type_models/sys.json");
+    include_str!("../../../sdk/generated/tuta-sdk/rust/sdk/src/type_models/sys.json");
 const TUTANOTA_TYPE_MODELS_JSON: &str =
-    include_str!("../../../tuta-repo/tuta-sdk/rust/sdk/src/type_models/tutanota.json");
+    include_str!("../../../sdk/generated/tuta-sdk/rust/sdk/src/type_models/tutanota.json");
 
 fn parse_model_version(json: &str) -> u32 {
     // The SDK guarantees every entry of an app's type-model JSON carries the

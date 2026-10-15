@@ -1,55 +1,77 @@
-# Vendored SDK
+# Official SDK and local patches
 
-The bridge builds against Tuta's official Rust SDK, not a hand-maintained
-fork. `tuta-repo` is **generated**: the official release named in
-`sdk/BASE`, plus the patches in `sdk/patches/`, applied in order. Nothing in
-the generated tree is edited by hand.
+`tuta-repo` points directly at an official `tutao/tutanota` release commit.
+The bridge consumes a prepared local copy, never the unpatched submodule.
+No patched SDK commits are published to a fork.
 
 ```
-sdk/BASE                  official release tag + its commit
-sdk/patches/NN-*.patch    our changes, one concern each
-scripts/sdk-generate.sh   applies them, reproducibly
-tuta-repo                 submodule pinned at the generated commit
-crates/tuta               bridge-specific code that used to live in the fork
+sdk/BASE                  official release tag and exact commit
+tuta-repo                 official submodule, kept clean
+sdk/patches/NN-*.patch     ordered changes, one concern each
+sdk/EXPECTED              base, patch SHA256s, patched tree, exported digest
+sdk/generated             ignored prepared SDK, used by Cargo and fixtures
+scripts/sdk-prepare.py    offline preparation and verification
+crates/tuta               bridge-specific extensions and build guard
 ```
 
-The result is hosted on the SDK fork (`spartanz51/tutanota`, one branch per
-generated commit, `generated/<version>-<commit>`, never rewritten) only so
-that `cargo`, CI, `dev.sh` and the AUR `-git` package keep building from a
-plain submodule. The fork is an output, not a source.
+## Building and checking
 
-## Checking a pin
+Initialize the submodule, then prepare the SDK before any Cargo command:
 
 ```sh
-scripts/sdk-generate.sh --check
+git submodule sync
+git submodule update --init tuta-repo
+python3 scripts/sdk-prepare.py
+cargo build --locked
 ```
 
-Regenerates the SDK from `sdk/BASE` and `sdk/patches/` and fails unless the
-pinned `tuta-repo` commit is exactly that. Generation is reproducible (fixed
-committer, committer date taken from each patch), so the same inputs always
-give the same commit. It also fails if the patches touch the SDK's
-`Cargo.toml`: the client version Tuta checks must be the release's own,
-never an edit. CI runs this on every pull request.
+Preparation needs Python 3 and Git, and works offline once the official commit
+is available. It applies patches in an isolated Git index, verifies the full
+tree against EXPECTED, and extracts the root manifest, license, Rust SDK and
+compatibility fixture into sdk/generated. Source checkouts stay unchanged;
+Git may retain unreachable tree/blob objects until garbage collection.
+
+The content digest includes sorted UTF-8 relative paths and raw file bytes,
+with u64 big-endian lengths. Modes and timestamps are excluded for Windows
+portability. Symlinks and special files are refused. Git configuration is
+isolated and export uses LF bytes on all platforms. Successful repeated
+preparation is a no-op; a corrupted output is rebuilt in staging and verified
+before replacement. Do not run preparation concurrently with compilation.
 
 ```sh
-scripts/sdk-generate.sh --verify-each
+python3 scripts/sdk-prepare.py check
+python3 scripts/sdk-prepare.py --verify-each
 ```
 
-Also checks every patch on its own: after each one, the SDK must be
-formatted and pass its tests. Slower; run it whenever a
-patch changes.
+`check` verifies inputs and output without modifying them. `--verify-each`
+also formats/checks and tests the complete SDK after every patch. Tests run
+in disposable source directories, not in sdk/generated. Prepared sources
+must remain unchanged; keep build output in the bridge's target directory.
 
-## Moving to a new Tuta release
+The Rust build guard checks BASE, EXPECTED, patch SHA256s and all generated
+file bytes. It runs without Python, Git, network access or writes. Missing,
+stale or altered SDK content prevents a successful bridge build. Cargo may
+load dependency manifests and start compiling dependencies before the guard;
+it is an integrity check, not a sandbox for untrusted code. Sources and
+locked dependencies are reproducible; bit-identical binaries additionally
+require a controlled compiler and build environment.
 
-The automated path is described in **Automatic releases** below. Ordinary
-bumps require no manual SDK edit or tag. If verification fails, fix or remove
-the affected patch in `sdk/patches`, test it with
-`scripts/sdk-generate.sh --verify-each`, and review that correction before
-rerunning the workflow. Do not edit the generated submodule by hand.
+## Updating patches or the official base
 
-Tuta raises the minimum client version it accepts every few months (HTTP
-474 below it), so staying on recent releases is what keeps the bridge able
-to log in.
+Change sdk/patches deliberately; never edit generated files. For a new base,
+update sdk/BASE and the official submodule gitlink together. Then run:
+
+```sh
+python3 scripts/sdk-prepare.py --update-expected --verify-each
+cargo update --workspace
+cargo test --locked --workspace
+```
+
+Review EXPECTED and Cargo.lock with the source changes. The ordinary build
+never updates EXPECTED. A patch already included upstream fails with a
+removal diagnostic; partially integrated patches require manual review.
+Patches may not change SDK crate versions. The client version remains the
+official release's own. Offline tests do not prove server acceptance.
 
 ## The patches
 
@@ -80,60 +102,47 @@ SDK's public API and now lives in `crates/tuta`.
 AEAD **writes** are not included: they are prototyped on the
 `lab/sdk-official` branch but not validated against a real account.
 
-## History
-
-Until September 2026 the SDK was a fork of tutao's 348 release carrying
-twelve bridge commits. Its version string was raised to 359 to clear Tuta's
-version floor (#38), then @ninjapanzer rebased the commits onto the real
-359 release (#47) and documented why a relabelled version is not a real
-one. This layout replaces the fork with generated releases, so a new Tuta
-release is a new tag in `sdk/BASE`, a regeneration and a test run.
-
-
 ## Automatic releases
 
-Every other Monday at 06:00 UTC (anchor: 2026-10-19), `sdk-bump.yml`
-selects the latest official Tuta release tag. The weekly cron exits on the
-alternate week before querying Tuta. An unfinished release is resumed on
-the next weekly wake-up; the fortnightly gate applies only to new bumps.
-A manual run bypasses the date guard.
-The GUI checks for published updates every six hours; this is a separate clock.
+Every other Monday at 06:00 UTC (anchor 2026-10-19), sdk-bump.yml selects the
+latest official release. The alternate weekly wake only resumes an unfinished
+release. A manual dispatch bypasses the calendar guard. The GUI's six-hour
+update check is independent.
 
-The workflow tests every patch and resolves the bridge lockfile conservatively
-in a job without publication credentials, including during dry runs. It checks
-locked Cargo metadata and passes only a bounded lockfile diff and its SHA256
-to the publishing job. New dependency sources require review. It regenerates the same SDK commit in a fresh Git-only job, and opens a candidate
-PR. Full bridge CI runs against that exact commit. Only the expected SDK pin,
-base, submodule branch, `Cargo.lock` and `release-plan.json` may change.
-Bridge builds and tests use `--locked`; they cannot repair a stale lock silently. The candidate is
-integrated with a normal fast-forward only while main is still its captured
-parent. Human changes to candidate branches are never overwritten.
+The isolated verifier prepares the SDK, tests each patch and resolves the
+bridge lockfile. It passes the patched tree and bounded lock diff/digest to a
+fresh writer. The writer independently prepares the same SDK using Git and
+Python only, compares its tree, and creates the bridge candidate. It never
+executes upstream code or pushes to an SDK fork. Allowed candidate changes:
+sdk/BASE, sdk/EXPECTED, the official tuta-repo gitlink, Cargo.lock and
+release-plan.json. Patch changes and .gitmodules changes require separate
+review. Full locked bridge CI gates normal fast-forward integration.
 
-A failed patch produces a diagnostic PR, never a merge or release. If Tuta has
-already incorporated a patch, review and remove it from `sdk/patches` before
-rerunning. Offline tests do not establish that the live Tuta service accepts
-the SDK; there is no live account test in this pipeline.
+New plans record version, tag, upstream, tree, base and lock. The introducing
+commit remains the immutable release source; a retry resumes that source
+before proposing another SDK. Legacy plans with a generated commit remain
+valid. Historical builds through rc.14 still use their fork pin and original
+build scripts, so that fork must be retained for old releases. The migration
+does not rewrite release-plan.json or publish another version.
 
-`release-plan.json` records the next rc version, SDK commits and lockfile SHA256. Its introducing
-commit is the immutable release source. If packaging or publication fails,
-rerunning SDK bump resumes that plan before considering a newer SDK. Builds
-run on Linux, macOS and Windows without signing keys or persisted Git credentials.
-A fresh job signs standard updater payloads, verifies them against the app's
-public key and publishes one complete `latest.json`. Published releases are
-never modified; a conflicting tag or draft stops for investigation.
+SDK_BUMP_TOKEN remains necessary for bridge candidate branches and PRs under
+the existing GitHub settings. New code never uses it to write the SDK fork;
+its permissions can be narrowed separately. Removing the PAT requires the
+repository to allow PR creation by GITHUB_TOKEN (and changes which automatic
+PR events trigger CI); that settings change is separate. Integration uses
+GITHUB_TOKEN. Signing credentials remain confined to the signing job.
 
-Secrets: `SDK_BUMP_TOKEN` can write the SDK fork and candidate PRs;
-`TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` sign updates.
-Main/tag/release writes use `GITHUB_TOKEN`, and downstream jobs are invoked
-explicitly rather than depending on token pushes to trigger workflows.
-Back up the signing key: installed apps trust its public counterpart.
+CI, release builds, dev.sh and AUR source package preparation invoke the same
+SDK preparer before Cargo. AUR binary packages are unchanged. Packaging and
+CLI builds use --locked. Release source from before the migration retains
+its old preparation path. Publication still requires every platform, signature
+and complete manifest to pass. Published releases are never overwritten.
 
-Validation modes: SDK bump with `dry_run=true` only regenerates/tests the SDK,
-without any push, PR or release. A manual Release run builds all platforms and
-signs with an ephemeral test key, publishing workflow artifacts only. Those
-preview signatures are intentionally not trusted by production apps.
-For a bridge-only fix or rollback, dispatch Release with `publish=true`, an
-explicit main commit and a new higher rc version. This path runs full CI too.
-Retry with the same version/source to resume an unpublished draft. Installed
-apps never downgrade their version. Editing a committed release plan by hand
-invalidates its provenance and stops automation until the plan is repaired.
+SDK dry runs make no remote writes. Release previews use an ephemeral signing
+key and publish only workflow artifacts; production applications do not trust
+those signatures. The migration's initial validation is local only: Windows
+and Linux hosted builds remain to be exercised after publication is authorized.
+
+The controller checks the `content=` digest format and binds the expected tree
+and patch hashes to the candidate. Preparation in each bridge CI job and the
+Rust build guard verify the actual file bytes against that digest.

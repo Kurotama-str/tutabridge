@@ -82,6 +82,35 @@ class WorkflowArguments(unittest.TestCase):
                 self.assertEqual(args, ['scripts/sdk-release.py','detect','--tag',env['INPUT_TAG']]+expected)
 
 
+    def test_failed_verification_does_not_export_previous_tree(self):
+        workflow = (SCRIPTS.parent / '.github/workflows/sdk-bump.yml').read_text()
+        body = workflow.split('      - name: Regenerate the SDK and verify every patch', 1)[1].split('        run: |\n', 1)[1]
+        lines = []
+        for line in body.splitlines():
+            if line and not line.startswith('          '):
+                break
+            lines.append(line[10:])
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            (root / 'sdk').mkdir()
+            (root / 'sdk/EXPECTED').write_text('tree=' + '3' * 40 + '\n')
+            executable = root / 'python3'
+            executable.write_text('#!/bin/sh\necho fixture-result\nexit "$FIXTURE_STATUS"\n')
+            executable.chmod(0o755)
+            for status in ('0', '1'):
+                output = root / ('output-' + status)
+                env = dict(os.environ, PATH=str(root) + ':' + os.environ['PATH'],
+                           FIXTURE_STATUS=status, GITHUB_OUTPUT=str(output),
+                           GITHUB_STEP_SUMMARY=str(root / 'summary'), TAG='fixture')
+                result = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', '\n'.join(lines)],
+                                        cwd=root, env=env, capture_output=True)
+                self.assertEqual(result.returncode, int(status))
+                expected = '3' * 40 if status == '0' else ''
+                self.assertIn('generated=' + expected + '\n', output.read_text())
+                if status != '0':
+                    self.assertNotIn('3' * 40, output.read_text())
+
+
 class GitCandidate(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -167,26 +196,6 @@ class GitCandidate(unittest.TestCase):
         for extra in (b'[[package]]\nname="new"\nversion="1.0.0"\nsource="git+https://example.test/new"\n',b'[patch]\nunused=[]\n'):
             with self.assertRaisesRegex(ValueError,'requires review'):
                 sdk.validate_lock(before,after+extra)
-
-    def test_successful_candidate_carries_verifier_lock_and_digest(self):
-        diff=subprocess.check_output(['git','diff',self.base,self.source,'--','Cargo.lock'])
-        sdk.git('checkout','--detach',self.base)
-        real_git,real_run=sdk.git,sdk.run
-        def git(*args):
-            if args[0]=='ls-remote': return ''
-            if args[:2]==('-C','tuta-repo'): return '3'*40
-            if args[0]=='add' and 'tuta-repo' in args:
-                real_git('add',*[p for p in args[1:] if p!='tuta-repo'])
-                return real_git('update-index','--cacheinfo',f'160000,{"3"*40},tuta-repo')
-            return real_git(*args)
-        def run(*args,**kwargs):
-            return '' if args[:2]==('bash','scripts/sdk-generate.sh') else real_run(*args,**kwargs)
-        env=dict(BASE=self.base,TAG=self.plan['tag'],UPSTREAM_SHA='2'*40,GENERATED='3'*40,VERIFIED='success',VERSION=self.plan['version'],GITHUB_RUN_ID='123',SDK_BUMP_TOKEN='fixture',LOCK_DIFF=base64.b64encode(gzip.compress(diff)).decode(),LOCK_HASH=self.plan['lock'])
-        with patch.dict(os.environ,env),patch.object(sdk,'git',side_effect=git),patch.object(sdk,'run',side_effect=run),patch.object(sdk,'push'),patch.object(sdk,'open_pr') as pr,patch.object(sdk,'outputs') as out:
-            sdk.candidate(None)
-            self.assertTrue(out.call_args.kwargs['ready'])
-            self.assertEqual(sdk.validate_candidate(out.call_args.kwargs['source']),self.plan)
-            self.assertIn('sdk: 360.0.0 → 361.0.0',pr.call_args.args[2])
 
     def test_release_source_reads_remote_main_instead_of_checkout_ref(self):
         remote = self.location / 'remote.git'
@@ -311,6 +320,53 @@ class GitCandidate(unittest.TestCase):
             self.assertIn('never automatically integrated',pr.call_args.args[2])
             self.assertEqual(real_git('diff-tree','--no-commit-id','--name-only','-r','HEAD'),'sdk/BASE')
             self.assertEqual(real_git('show','-s','--format=%an%n%ae%n%cn%n%ce','HEAD').splitlines(),[sdk.BOT_NAME,sdk.BOT_EMAIL,sdk.BOT_NAME,sdk.BOT_EMAIL])
+
+
+class OfficialCandidate(GitCandidate):
+    def setUp(self):
+        super().setUp()
+        sdk.git('checkout','--detach',self.base)
+        Path('.gitmodules').write_text('[submodule "tuta-repo"]\npath = tuta-repo\nurl = '+sdk.UPSTREAM+'\n')
+        Path('sdk/patches').mkdir()
+        Path('sdk/patches/01.patch').write_text('fixture patch')
+        self.record='patch=01.patch:'+hashlib.sha256(b'fixture patch').hexdigest()+'\n'
+        Path('sdk/EXPECTED').write_text('base='+'1'*40+'\ntree='+'1'*40+'\ncontent='+'0'*64+'\n'+self.record)
+        sdk.git('add','.');sdk.git('commit','-qm','official base')
+        self.base=sdk.git('rev-parse','HEAD')
+        sdk.set_base('tutanota-release-361.261006.0','2'*40)
+        self.plan=dict(base=self.base,version='0.1.0-rc.14',tag='tutanota-release-361.261006.0',upstream='2'*40,tree='3'*40)
+        Path('Cargo.lock').write_text(Path('Cargo.lock').read_text().replace('360.0.0','361.0.0'))
+        self.plan['lock']=hashlib.sha256(Path('Cargo.lock').read_bytes()).hexdigest()
+        Path('release-plan.json').write_text(json.dumps(self.plan))
+        self.expected='base='+'2'*40+'\ntree='+'3'*40+'\ncontent='+'0'*64+'\n'+self.record
+        Path('sdk/EXPECTED').write_text(self.expected)
+        sdk.git('add','.');sdk.git('update-index','--cacheinfo',f'160000,{"2"*40},tuta-repo')
+        sdk.git('commit','-qm','candidate');self.source=sdk.git('rev-parse','HEAD')
+        sdk.git('branch','-f','main',self.source)
+
+    def amend(self):
+        sdk.git('add','.')
+        sdk.git('update-index','--cacheinfo',f'160000,{"2"*40},tuta-repo')
+        sdk.git('commit','--amend','--no-edit','-q')
+        return sdk.git('rev-parse','HEAD')
+
+    def test_expected_tree_patch_and_official_pin_must_match(self):
+        for old,new in [('tree='+'3'*40,'tree='+'4'*40),('patch=01.patch:','patch=02.patch:')]:
+            Path('sdk/EXPECTED').write_text(self.expected.replace(old,new))
+            with self.assertRaises(ValueError):sdk.validate_candidate(self.amend())
+        Path('sdk/EXPECTED').write_text(self.expected);self.amend()
+        sdk.git('update-index','--cacheinfo',f'160000,{"4"*40},tuta-repo')
+        sdk.git('commit','--amend','--no-edit','-q')
+        with self.assertRaisesRegex(ValueError,'pin'):sdk.validate_candidate(sdk.git('rev-parse','HEAD'))
+
+    def test_current_historical_release_plan_remains_valid(self):
+        # Read-only audit of the real plan left on main at migration time.
+        with cwd(SCRIPTS.parent):
+            source='da7cd5162e519c189af268283c0c02490eee8582'
+            if subprocess.run(['git','cat-file','-e',source],capture_output=True).returncode:
+                self.skipTest('Historical commit absent from shallow checkout')
+            plan=sdk.validate_candidate(source)
+            self.assertEqual(plan['generated'],'3408df1853d274efc719c74cef80d4e013ad49cc')
 
 
 class CargoLockResolution(unittest.TestCase):

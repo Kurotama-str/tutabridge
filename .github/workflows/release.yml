@@ -111,6 +111,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Prepare and verify patched SDK
+        working-directory: source
+        shell: bash
+        run: |
+          if [ -f scripts/sdk-prepare.py ]; then
+            python scripts/sdk-prepare.py
+          fi
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust_targets }}
@@ -145,14 +152,14 @@ jobs:
         run: |
           args=()
           if [ -n "$TAURI_ARGS" ]; then read -r -a args <<< "$TAURI_ARGS"; fi
-          tauri build "${args[@]}"
+          tauri build "${args[@]}" -- --locked
           cargo build --locked --release -p tutabridge
       - name: Build Windows bundles and CLI with native tools
         if: runner.os == 'Windows'
         working-directory: source
         shell: pwsh
         run: |
-          tauri build
+          tauri.cmd build --% -- --locked
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo build --locked --release -p tutabridge
       - name: Prepare standard updater payloads and installers

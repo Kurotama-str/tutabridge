@@ -206,11 +206,12 @@ session.
 
 ## Build from source
 
-Requires the Rust toolchain and the `tuta-repo` submodule
+Requires Rust, Python 3 (preparation only), Git and the official `tuta-repo` submodule
 (`git clone --recursive`, or `git submodule update --init --recursive`):
 
 ```bash
-cargo build                      # CLI + core
+python3 scripts/sdk-prepare.py    # prepare and verify the patched SDK
+cargo build --locked             # CLI + core
 cargo build -p tutabridge-core   # core library only
 cargo run                        # run the CLI from source
 ./dev.sh                         # GUI in dev mode (cargo tauri dev)
@@ -251,8 +252,9 @@ from `config.toml` automatically.
 ## SDK
 
 TutaBridge builds on Tuta's official Rust SDK release plus a small series of
-patches, generated into the `tuta-repo` submodule by
-`scripts/sdk-generate.sh`. See [`docs/SDK_PATCHES.md`](docs/SDK_PATCHES.md)
+patches. `tuta-repo` points directly at the official release commit;
+`python3 scripts/sdk-prepare.py` prepares and verifies a local copy in
+`sdk/generated`. No SDK fork is needed for new builds. See [`docs/SDK_PATCHES.md`](docs/SDK_PATCHES.md)
 for the patches and [`docs/SDK_UPSTREAM.md`](docs/SDK_UPSTREAM.md) for the
 ones proposed to Tuta.
 
