@@ -141,7 +141,11 @@ pub async fn get_stats(state: State<'_, BridgeState>) -> Result<BridgeStats, Str
 #[tauri::command]
 pub async fn get_bridge_password() -> Result<Option<String>, String> {
     let cfg = config::load_config().map_err(|e| e.to_string())?;
-    Ok(cfg.and_then(|c| c.bridge_password))
+    let pw = cfg.and_then(|c| c.bridge_password);
+    if pw.as_deref().is_some_and(tutabridge_core::bridge_auth::is_hashed) {
+        return Err("The bridge password is stored as an Argon2 hash and cannot be shown".into());
+    }
+    Ok(pw)
 }
 
 #[tauri::command]
@@ -159,7 +163,10 @@ pub async fn get_mcp_client_config() -> Result<String, String> {
     let cfg = config::load_config()
         .map_err(|e| e.to_string())?
         .unwrap_or_default();
-    let token = cfg.bridge_password.unwrap_or_default();
+    let mut token = cfg.bridge_password.unwrap_or_default();
+    if tutabridge_core::bridge_auth::is_hashed(&token) {
+        token = "<your bridge password>".into();
+    }
     let snippet = serde_json::json!({
         "mcpServers": {
             "tutabridge": {

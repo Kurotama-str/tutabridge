@@ -189,6 +189,12 @@ impl BridgeHandle {
             return Err(self.start_failed(msg).await);
         }
 
+        // Before any listener is bound: while the session passphrase is
+        // missing, mail clients get a refused connection, not a hang.
+        if let Err(msg) = crate::session_vault::ensure_unlocked(&config).await {
+            return Err(self.start_failed(msg).await);
+        }
+
         let tls_acceptor = match tls::load_or_create_tls_acceptor() {
             Ok(a) => a,
             Err(e) => return Err(self.start_failed(format!("TLS setup failed: {e}")).await),

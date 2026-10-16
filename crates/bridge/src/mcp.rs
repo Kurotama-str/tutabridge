@@ -482,7 +482,7 @@ fn authorized(auth_header: Option<&str>, token: Option<&str>) -> bool {
         return true;
     };
     match auth_header.and_then(|h| h.strip_prefix("Bearer ")) {
-        Some(presented) => presented == token,
+        Some(presented) => crate::bridge_auth::verify(presented, token),
         None => false,
     }
 }

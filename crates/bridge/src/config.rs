@@ -27,6 +27,35 @@ pub struct Config {
     /// it never contacts GitHub on its own. The CLI never updates itself.
     #[serde(default = "default_auto_update")]
     pub auto_update: bool,
+    /// How `session.json` is protected when the session is kept in a file
+    /// (`TUTABRIDGE_SESSION_STORE=file`). `file` and `web` encrypt it with a
+    /// passphrase that is supplied at every start; they need
+    /// `session_encryption_key`. The OS keychain is never affected.
+    #[serde(default)]
+    pub session_encryption_method: SessionEncryptionMethod,
+    /// Argon2id hash (`$argon2id$...`, see `tutabridge hash-password`) of the
+    /// session passphrase. Only used to check the passphrase that is entered.
+    #[serde(default)]
+    pub session_encryption_key: String,
+    /// Method `file`: the file the passphrase is written to. Defaults to
+    /// `unlock` in the config directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_unlock_file: Option<String>,
+    /// Method `web`: port of the unlock page (TLS, on the bind address).
+    #[serde(default = "default_unlock_port")]
+    pub session_unlock_port: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionEncryptionMethod {
+    /// `session.json` is stored unencrypted.
+    #[default]
+    None,
+    /// The passphrase is written to the unlock file.
+    File,
+    /// The passphrase is entered on a web page.
+    Web,
 }
 
 /// What a connected LLM may read over the MCP server. Strictly read-only — the
@@ -72,6 +101,10 @@ fn default_mcp_port() -> u16 {
 
 fn default_api_url() -> String {
     "https://app.tuta.com".to_string()
+}
+
+fn default_unlock_port() -> u16 {
+    8080
 }
 
 fn default_auto_update() -> bool {
@@ -129,6 +162,10 @@ impl Default for Config {
             mcp_permission: McpPermission::default(),
             mcp_port: default_mcp_port(),
             auto_update: default_auto_update(),
+            session_encryption_method: SessionEncryptionMethod::default(),
+            session_encryption_key: String::new(),
+            session_unlock_file: None,
+            session_unlock_port: default_unlock_port(),
         }
     }
 }
@@ -144,6 +181,10 @@ pub(crate) fn data_dir() -> PathBuf {
 /// keychain: set `TUTABRIDGE_SESSION_STORE=file`.
 pub fn session_store_is_file() -> bool {
     std::env::var("TUTABRIDGE_SESSION_STORE").is_ok_and(|v| v.trim().eq_ignore_ascii_case("file"))
+}
+
+pub fn default_unlock_file_path() -> PathBuf {
+    data_dir().join("unlock")
 }
 
 pub fn session_file_path() -> PathBuf {
@@ -358,6 +399,10 @@ smtp_port = 1025
             mcp_permission: McpPermission::Full,
             mcp_port: 1944,
             auto_update: false,
+            session_encryption_method: SessionEncryptionMethod::None,
+            session_encryption_key: String::new(),
+            session_unlock_file: None,
+            session_unlock_port: 8080,
         };
         let serialized = toml::to_string_pretty(&cfg).unwrap();
         let deserialized: Config = toml::from_str(&serialized).unwrap();

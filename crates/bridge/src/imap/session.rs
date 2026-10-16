@@ -165,7 +165,7 @@ impl ImapSession {
             if let Some(refusal) = self.lockout_response(&tag) {
                 return refusal;
             }
-            if password != *expected {
+            if !crate::bridge_auth::verify(&password, expected) {
                 self.login_failed();
                 return vec![format!(
                     "{} NO [AUTHENTICATIONFAILED] Invalid credentials\r\n",
@@ -328,7 +328,7 @@ impl ImapSession {
                 return refusal;
             }
             let (_, password) = parse_login_args(args);
-            if password != *expected {
+            if !crate::bridge_auth::verify(&password, expected) {
                 self.login_failed();
                 return vec![format!(
                     "{} NO [AUTHENTICATIONFAILED] Invalid credentials\r\n",

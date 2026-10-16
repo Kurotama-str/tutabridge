@@ -1,4 +1,5 @@
 mod auth_guard;
+pub mod bridge_auth;
 pub mod backup;
 pub mod body_cache;
 pub mod bridge;
@@ -11,6 +12,7 @@ pub mod mail;
 pub mod mcp;
 mod net;
 pub mod smtp;
+pub mod session_vault;
 pub mod store;
 pub mod sync;
 pub mod tls;

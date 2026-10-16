@@ -33,7 +33,33 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("No bridge password yet — run the bridge once to generate one.");
                 std::process::exit(1);
             };
+            if tutabridge_core::bridge_auth::is_hashed(&pw) {
+                eprintln!("The bridge password is stored as an Argon2 hash and cannot be shown.");
+                std::process::exit(1);
+            }
             println!("{pw}");
+            return Ok(());
+        }
+        Some("hash-password") => {
+            use std::io::IsTerminal;
+            let password = if std::io::stdin().is_terminal() {
+                let first = rpassword::prompt_password("Bridge password: ")?;
+                let second = rpassword::prompt_password("Repeat: ")?;
+                if first != second {
+                    anyhow::bail!("Passwords do not match");
+                }
+                first
+            } else {
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line)?;
+                line.trim_end_matches(['\r', '\n']).to_string()
+            };
+            if password.is_empty() {
+                anyhow::bail!("Password is empty");
+            }
+            let hash = tutabridge_core::bridge_auth::hash(&password)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("{hash}");
             return Ok(());
         }
         Some("--help") | Some("-h") | Some("help") => {
@@ -41,6 +67,9 @@ async fn main() -> anyhow::Result<()> {
             println!("tutabridge backup <dir>    export every mail to <dir> as .eml files");
             println!(
                 "tutabridge password        print the local bridge password (mail client setup)"
+            );
+            println!(
+                "tutabridge hash-password   print an Argon2 hash to use as bridge_password in config.toml"
             );
             return Ok(());
         }

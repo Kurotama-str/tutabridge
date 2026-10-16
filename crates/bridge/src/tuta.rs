@@ -1138,6 +1138,7 @@ pub async fn login_with_2fa(
     password: Option<&str>,
     totp_callback: Option<TwoFactorCallback>,
 ) -> Result<TutaSession, Box<dyn std::error::Error + Send + Sync>> {
+    crate::session_vault::ensure_unlocked(cfg).await?;
     let raw_client: Arc<dyn RestClient> =
         Arc::new(tutasdk::net::native_rest_client::NativeRestClient::try_new()?);
     // Route every SDK request through the rate governor (bounded concurrency +
@@ -1305,6 +1306,16 @@ fn classify_resume_failure(e: &tutasdk::login::LoginError) -> ResumeFailure {
 }
 
 pub fn has_saved_session(email: &str) -> bool {
+    // An encrypted session file cannot be read before the passphrase is
+    // entered, but it is a saved session all the same.
+    if crate::config::session_store_is_file() && crate::session_vault::active_passphrase().is_none()
+    {
+        if let Ok(text) = std::fs::read_to_string(crate::config::session_file_path()) {
+            if crate::session_vault::is_encrypted(&text) {
+                return true;
+            }
+        }
+    }
     load_credentials(email).is_some()
 }
 
@@ -1324,15 +1335,7 @@ fn save_credentials(email: &str, creds: &tutasdk::login::Credentials) {
     });
 
     if crate::config::session_store_is_file() {
-        let path = crate::config::session_file_path();
-        let written = path
-            .parent()
-            .map_or(Ok(()), crate::fs_private::create_dir_all_private)
-            .and_then(|_| crate::fs_private::write_private(&path, data.to_string()));
-        match written {
-            Ok(()) => log::info!("Session saved to {}", path.display()),
-            Err(e) => log::warn!("Failed to save session to {}: {e}", path.display()),
-        }
+        write_session_file(&data.to_string());
     } else {
         match keyring::Entry::new(KEYRING_SERVICE, email) {
             Ok(entry) => {
@@ -1346,6 +1349,37 @@ fn save_credentials(email: &str, creds: &tutasdk::login::Credentials) {
         }
     }
     *CREDENTIALS_CACHE.lock().unwrap() = Some(Some(creds.clone()));
+}
+
+/// Write `session.json`, encrypted when a passphrase is active. Nothing is
+/// written while an encrypted file the bridge could not open is protected.
+fn write_session_file(json: &str) {
+    let path = crate::config::session_file_path();
+    if crate::session_vault::writes_blocked() {
+        log::warn!(
+            "Session not saved: {} is encrypted and could not be opened",
+            path.display()
+        );
+        return;
+    }
+    let contents = match crate::session_vault::active_passphrase() {
+        Some(passphrase) => match crate::session_vault::encrypt(&passphrase, json.as_bytes()) {
+            Ok(sealed) => sealed,
+            Err(e) => {
+                log::warn!("Failed to encrypt the session, not saved: {e}");
+                return;
+            }
+        },
+        None => json.to_string(),
+    };
+    let written = path
+        .parent()
+        .map_or(Ok(()), crate::fs_private::create_dir_all_private)
+        .and_then(|_| crate::fs_private::write_private(&path, contents));
+    match written {
+        Ok(()) => log::info!("Session saved to {}", path.display()),
+        Err(e) => log::warn!("Failed to save session to {}: {e}", path.display()),
+    }
 }
 
 fn load_credentials(email: &str) -> Option<tutasdk::login::Credentials> {
@@ -1363,7 +1397,36 @@ fn load_credentials_from_keyring(email: &str) -> Option<tutasdk::login::Credenti
     if crate::config::session_store_is_file() {
         let path = crate::config::session_file_path();
         crate::fs_private::tighten(&path);
-        let creds = credentials_from_json(&std::fs::read_to_string(path).ok()?)?;
+        let text = std::fs::read_to_string(&path).ok()?;
+        let json = if crate::session_vault::is_encrypted(&text) {
+            let Some(passphrase) = crate::session_vault::active_passphrase() else {
+                crate::session_vault::block_writes();
+                log::error!(
+                    "{} is encrypted but no passphrase is available; the saved session is not used",
+                    path.display()
+                );
+                return None;
+            };
+            match crate::session_vault::decrypt(&passphrase, &text) {
+                Ok(bytes) => String::from_utf8(bytes).ok()?,
+                Err(e) => {
+                    crate::session_vault::block_writes();
+                    log::error!(
+                        "Cannot decrypt {} ({e}); it is left untouched and the saved session \
+                         is not used",
+                        path.display()
+                    );
+                    return None;
+                }
+            }
+        } else {
+            // A plaintext file with encryption active: encrypt it now.
+            if crate::session_vault::active_passphrase().is_some() {
+                write_session_file(&text);
+            }
+            text
+        };
+        let creds = credentials_from_json(&json)?;
         // The file is not keyed by address the way a keychain entry is, so a
         // session saved for another account must not be resumed.
         return creds.login.eq_ignore_ascii_case(email).then_some(creds);
