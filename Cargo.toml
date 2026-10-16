@@ -1,6 +1,6 @@
 [workspace]
 members = ["crates/bridge", "crates/tuta", "src-tauri"]
-exclude = ["tuta-repo"]
+exclude = ["tuta-repo", "sdk/generated"]
 resolver = "2"
 
 [package]
@@ -13,7 +13,7 @@ license = "GPL-3.0-or-later"
 [dependencies]
 tutabridge-tuta = { path = "crates/tuta" }
 tutabridge-core = { path = "crates/bridge" }
-tuta-sdk = { path = "tuta-repo/tuta-sdk/rust/sdk", features = ["net"] }
+tuta-sdk = { path = "sdk/generated/tuta-sdk/rust/sdk", features = ["net"] }
 tokio = { version = "1.43", features = ["full"] }
 tokio-rustls = { version = "0.26", features = ["ring"] }
 log = "0.4"

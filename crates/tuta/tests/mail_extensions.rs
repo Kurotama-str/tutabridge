@@ -31,7 +31,7 @@ use tutasdk::{CustomId, GeneratedId, IdTupleGenerated, LoggedInSdk, Sdk};
 const FIXTURES: &str = "http://localhost:9000";
 const DRAFT_URL: &str = "http://localhost:9000/rest/tutanota/MailDetailsDraft/draft-list/draft-id";
 const MAIL_JSON: &str =
-    include_str!("../../../tuta-repo/tuta-sdk/rust/sdk/tests/download_mail_test/mail.json");
+    include_str!("../../../sdk/generated/tuta-sdk/rust/sdk/tests/download_mail_test/mail.json");
 
 /// Blob contents served per archive id, as (blob id, bytes).
 type BlobsByArchive = HashMap<String, Vec<(GeneratedId, Vec<u8>)>>;
@@ -182,7 +182,7 @@ async fn session_with_move_status(move_status: u32) -> Session {
         200,
         HashMap::default(),
         Some(include_bytes!(
-            "../../../tuta-repo/tuta-sdk/rust/sdk/tests/download_mail_test/session.json"
+            "../../../sdk/generated/tuta-sdk/rust/sdk/tests/download_mail_test/session.json"
         )),
     );
     fixtures.insert_response(
@@ -191,7 +191,7 @@ async fn session_with_move_status(move_status: u32) -> Session {
         200,
         HashMap::default(),
         Some(include_bytes!(
-            "../../../tuta-repo/tuta-sdk/rust/sdk/tests/download_mail_test/user.json"
+            "../../../sdk/generated/tuta-sdk/rust/sdk/tests/download_mail_test/user.json"
         )),
     );
     let server = Arc::new(TestServer {
@@ -1276,7 +1276,7 @@ fn install_bucket(
         Group, GroupKeysRef, InstanceSessionKey, KeyPair, TypeInfo,
     };
     let vectors: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../tuta-repo/test/tests/api/worker/crypto/CompatibilityTestData.json"
+        "../../../sdk/generated/test/tests/api/worker/crypto/CompatibilityTestData.json"
     ))
     .unwrap();
     let hex = |value: &serde_json::Value| {

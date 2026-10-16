@@ -4,3 +4,6 @@
 .DS_Store
 dry-run/
 __pycache__/
+
+/sdk/generated/
+/sdk/.sdk-stage-*/

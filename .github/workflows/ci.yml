@@ -27,23 +27,26 @@ jobs:
     # tests for the whole workspace.
     runs-on: macos-latest
     steps:
-      - name: Checkout (with vendored SDK submodule)
+      - name: Checkout (with official SDK submodule)
         uses: actions/checkout@v4
         with:
-          # The Tuta Rust SDK is vendored as the `tuta-repo` submodule and
-          # the build does not work without it.
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
           submodules: recursive
-          # Full history so the submodule's pinned commit (which lives on a
-          # fork branch, not necessarily a branch tip) is always reachable —
-          # a shallow fetch can miss it.
           fetch-depth: 0
 
-      # The vendored SDK is generated, never edited: it must be exactly the
-      # official Tuta release named in sdk/BASE plus sdk/patches.
-      - name: Verify vendored SDK
-        run: scripts/sdk-generate.sh --check
+      - name: Prepare and verify patched SDK
+        shell: bash
+        run: |
+          if [ -f scripts/sdk-prepare.py ]; then
+            if [ "$RUNNER_OS" = Windows ]; then
+              python scripts/sdk-prepare.py
+            else
+              python3 scripts/sdk-prepare.py
+            fi
+          else
+            scripts/sdk-generate.sh --check
+          fi
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -96,13 +99,26 @@ jobs:
     # (no gtk / webkit). The GUI is intentionally not built here.
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout (with vendored SDK submodule)
+      - name: Checkout (with official SDK submodule)
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
           submodules: recursive
           fetch-depth: 0
+
+      - name: Prepare and verify patched SDK
+        shell: bash
+        run: |
+          if [ -f scripts/sdk-prepare.py ]; then
+            if [ "$RUNNER_OS" = Windows ]; then
+              python scripts/sdk-prepare.py
+            else
+              python3 scripts/sdk-prepare.py
+            fi
+          else
+            scripts/sdk-generate.sh --check
+          fi
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -120,11 +136,6 @@ jobs:
       - name: Build CLI (lean, no GUI)
         run: cargo build --locked --release -p tutabridge
 
-      # Same check as on macOS: GNU tools and Ubuntu's git must generate the
-      # same SDK commit.
-      - name: Verify vendored SDK
-        run: scripts/sdk-generate.sh --check
-
       - name: Test core and the SDK extensions
         run: cargo test --locked -p tutabridge-core -p tutabridge-tuta
 
@@ -136,13 +147,26 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Checkout (with vendored SDK submodule)
+      - name: Checkout (with official SDK submodule)
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
           submodules: recursive
           fetch-depth: 0
+
+      - name: Prepare and verify patched SDK
+        shell: bash
+        run: |
+          if [ -f scripts/sdk-prepare.py ]; then
+            if [ "$RUNNER_OS" = Windows ]; then
+              python scripts/sdk-prepare.py
+            else
+              python3 scripts/sdk-prepare.py
+            fi
+          else
+            scripts/sdk-generate.sh --check
+          fi
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

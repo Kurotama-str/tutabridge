@@ -7,7 +7,7 @@ license = "GPL-3.0-or-later"
 
 [dependencies]
 tutabridge-tuta = { path = "../tuta" }
-tuta-sdk = { path = "../../tuta-repo/tuta-sdk/rust/sdk", features = ["net"] }
+tuta-sdk = { path = "../../sdk/generated/tuta-sdk/rust/sdk", features = ["net"] }
 
 tokio = { version = "1.43", features = ["full"] }
 async-trait = "0.1"
@@ -25,7 +25,7 @@ rcgen = "0.13"
 # Read-only MCP server (HTTP, localhost). Pure-Rust, builds on every target.
 axum = "0.7"
 
-crypto-primitives = { path = "../../tuta-repo/tuta-sdk/rust/crypto-primitives" }
+crypto-primitives = { path = "../../sdk/generated/tuta-sdk/rust/crypto-primitives" }
 
 rand = "0.8"
 argon2 = "0.5"
@@ -57,5 +57,5 @@ keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 
 [dev-dependencies]
 tutabridge-tuta = { path = "../tuta", features = ["testing"] }
-tuta-sdk = { path = "../../tuta-repo/tuta-sdk/rust/sdk", features = ["net", "logging", "testing"] }
+tuta-sdk = { path = "../../sdk/generated/tuta-sdk/rust/sdk", features = ["net", "logging", "testing"] }
 rpassword = "7"

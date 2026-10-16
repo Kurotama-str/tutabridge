@@ -1,0 +1,3 @@
+sdk/BASE text eol=lf
+sdk/EXPECTED text eol=lf
+sdk/patches/*.patch text eol=lf

@@ -5,6 +5,7 @@ import base64
 import gzip
 import hashlib
 import io
+import importlib.util
 from datetime import date, datetime, timezone
 import json
 import os
@@ -15,10 +16,10 @@ import tomllib
 
 REPO = 'spartanz51/tutabridge'
 UPSTREAM = 'https://github.com/tutao/tutanota.git'
-FORK = 'https://github.com/spartanz51/tutanota.git'
 BOT_NAME = 'github-actions[bot]'
 BOT_EMAIL = '41898282+github-actions[bot]@users.noreply.github.com'
-ALLOWED = {'.gitmodules', 'sdk/BASE', 'tuta-repo', 'release-plan.json', 'Cargo.lock'}
+LEGACY_ALLOWED = {'.gitmodules', 'sdk/BASE', 'tuta-repo', 'release-plan.json', 'Cargo.lock'}
+ALLOWED = {'sdk/BASE', 'sdk/EXPECTED', 'tuta-repo', 'release-plan.json', 'Cargo.lock'}
 LOCK_ENCODED_LIMIT = 64 * 1024
 LOCK_DIFF_LIMIT = 1024 * 1024
 TAG = re.compile(r'tutanota-release-(\d+)\.(\d{6})\.(\d+)\Z')
@@ -151,14 +152,14 @@ def lock_summary(before, after):
     return '\n'.join(changes) or 'No package version changes.'
 
 
-def validate_candidate(sha, expected_base=None, expected_generated=None):
+def validate_legacy_candidate(sha, expected_base=None, expected_generated=None):
     if not SHA.fullmatch(sha):
         raise ValueError('Expected full candidate SHA')
     parents = git('rev-list', '--parents', '-n', '1', sha).split()
     if len(parents) != 2 or (expected_base and parents[1] != expected_base):
         raise ValueError('Candidate must have the captured main as its only parent')
     files = set(git('diff-tree', '--no-commit-id', '--name-only', '-r', sha).splitlines())
-    if not ALLOWED - {'Cargo.lock'} <= files or not files <= ALLOWED:
+    if not LEGACY_ALLOWED - {'Cargo.lock'} <= files or not files <= LEGACY_ALLOWED:
         raise ValueError(f'Unexpected candidate files: {sorted(files)}')
     identity = git('show', '-s', '--format=%an%n%ae%n%cn%n%ce', sha).splitlines()
     if identity != [BOT_NAME, BOT_EMAIL, BOT_NAME, BOT_EMAIL]:
@@ -192,6 +193,64 @@ def validate_candidate(sha, expected_base=None, expected_generated=None):
     strip_branch = lambda text: re.sub(r'^\s*branch\s*=.*$', '', text, flags=re.M)
     if strip_branch(before) != strip_branch(after):
         raise ValueError('Unexpected submodule configuration changes')
+    return plan
+
+
+
+def preparation():
+    spec = importlib.util.spec_from_file_location('sdk_prepare', Path(__file__).with_name('sdk-prepare.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def validate_candidate(sha, expected_base=None, expected_generated=None):
+    if not SHA.fullmatch(sha):
+        raise ValueError('Expected full candidate SHA')
+    plan = json.loads(git('show', f'{sha}:release-plan.json'))
+    if set(plan) == {'version', 'tag', 'upstream', 'generated', 'base', 'lock'}:
+        return validate_legacy_candidate(sha, expected_base, expected_generated)
+    if set(plan) != {'version', 'tag', 'upstream', 'tree', 'base', 'lock'}:
+        raise ValueError('Unexpected release plan fields')
+    parents = git('rev-list', '--parents', '-n', '1', sha).split()
+    if len(parents) != 2 or (expected_base and parents[1] != expected_base):
+        raise ValueError('Candidate must have the captured main as its only parent')
+    files = set(git('diff-tree', '--no-commit-id', '--name-only', '-r', sha).splitlines())
+    if not ALLOWED - {'Cargo.lock'} <= files or not files <= ALLOWED:
+        raise ValueError(f'Unexpected candidate files: {sorted(files)}')
+    if git('show', '-s', '--format=%an%n%ae%n%cn%n%ce', sha).splitlines() != [BOT_NAME, BOT_EMAIL, BOT_NAME, BOT_EMAIL]:
+        raise ValueError('Candidate has an unexpected author or committer')
+    if not VERSION.fullmatch(plan['version']) or plan['base'] != parents[1]:
+        raise ValueError('Invalid release plan version or base')
+    if not all(SHA.fullmatch(plan[x]) for x in ('upstream','tree','base')):
+        raise ValueError('Invalid SDK tree or commit')
+    if validate_lock(lock_bytes(parents[1]), lock_bytes(sha)) != plan['lock']:
+        raise ValueError('Release plan lock digest does not match Cargo.lock')
+    sdk = base_at(sha)
+    if sdk['tag'] != plan['tag'] or sdk['commit'] != plan['upstream']:
+        raise ValueError('SDK base and release plan disagree')
+    if tag_key(sdk['tag']) <= tag_key(base_at(parents[1])['tag']):
+        raise ValueError('Candidate does not advance the SDK')
+    if git('rev-parse', f'{sha}:tuta-repo') != plan['upstream']:
+        raise ValueError('Official SDK pin and release plan disagree')
+    if expected_generated and expected_generated != plan['tree']:
+        raise ValueError('SDK tree differs from the verified output')
+    if git('show', f'{sha}:.gitmodules') != git('show', f'{parents[1]}:.gitmodules'):
+        raise ValueError('Unexpected submodule configuration changes')
+    settings = git('config','--blob',f'{sha}:.gitmodules','--list').splitlines()
+    if sorted(settings) != sorted(['submodule.tuta-repo.path=tuta-repo','submodule.tuta-repo.url='+UPSTREAM]):
+        raise ValueError('Expected only the official SDK submodule')
+    expected = git('show',f'{sha}:sdk/EXPECTED').splitlines()
+    if len(expected)<4 or expected[:2] != ['base='+plan['upstream'],'tree='+plan['tree']] or not re.fullmatch('content=[0-9a-f]{64}',expected[2]):
+        raise ValueError('SDK expected tree and release plan disagree')
+    patches = sorted(git('ls-tree','--name-only',sha+':sdk/patches').splitlines())
+    records=[]
+    for name in patches:
+        if not name.endswith('.patch'): continue
+        blob = subprocess.check_output(['git','show',f'{sha}:sdk/patches/{name}'])
+        records.append('patch='+name+':'+hashlib.sha256(blob).hexdigest())
+    if not records or expected[3:] != records:
+        raise ValueError('SDK expected patches differ from candidate')
     return plan
 
 
@@ -267,13 +326,13 @@ def candidate(args):
         if not SHA.fullmatch(generated):
             raise ValueError('Invalid verifier output')
         apply_lock(os.environ['LOCK_DIFF'], os.environ['LOCK_HASH'])
-        run('bash', 'scripts/sdk-generate.sh')
-        if git('-C', 'tuta-repo', 'rev-parse', 'HEAD') != generated:
+        git('-C','tuta-repo','fetch','--quiet',UPSTREAM,upstream)
+        git('-C','tuta-repo','checkout','--quiet','--detach',upstream)
+        git('add','tuta-repo')
+        prepared = preparation().prepare(Path.cwd(), update_expected=True)
+        if prepared['tree'] != generated:
             raise ValueError('Regeneration differs from verified SDK')
-        sdk_branch = f'generated/{stem}-{generated[:12]}'
-        push(FORK, generated, sdk_branch, os.environ['SDK_BUMP_TOKEN'], 'tuta-repo')
-        git('config', '-f', '.gitmodules', 'submodule.tuta-repo.branch', sdk_branch)
-        plan = dict(version=os.environ['VERSION'], tag=tag, upstream=upstream, generated=generated, base=base, lock=os.environ['LOCK_HASH'])
+        plan = dict(version=os.environ['VERSION'], tag=tag, upstream=upstream, tree=generated, base=base, lock=os.environ['LOCK_HASH'])
         Path('release-plan.json').write_text(json.dumps(plan, indent=2) + '\n')
         git('add', *sorted(ALLOWED))
     else:

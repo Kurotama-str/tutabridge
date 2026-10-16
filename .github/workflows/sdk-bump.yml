@@ -67,7 +67,7 @@ jobs:
       COMMIT: ${{ needs.detect.outputs.upstream }}
       BASE: ${{ needs.detect.outputs.base }}
     steps:
-      - name: Clone this repository and the vendored SDK
+      - name: Clone this repository and the official SDK
         run: |
           git clone --quiet "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" .
           git checkout --quiet "$BASE"
@@ -101,20 +101,26 @@ jobs:
       - name: Point sdk/BASE at the release
         run: |
           sed -i -e "s/^tag=.*/tag=$TAG/" -e "s/^commit=.*/commit=$COMMIT/" sdk/BASE
+          git -C tuta-repo fetch --quiet https://github.com/tutao/tutanota.git "$COMMIT"
+          git -C tuta-repo checkout --quiet --detach "$COMMIT"
+          git add tuta-repo
           cat sdk/BASE
 
       # After every patch the SDK must be formatted and pass its tests. The
-      # generator's last line names the failing patch; `publish` puts it in
-      # the PR. An explicit `shell: bash` turns pipefail on, so the status
-      # is the generator's, not tee's.
+      # final diagnostic is included in the job summary. Explicit bash
+      # enables pipefail, so the status is the preparer's, not tee's.
       - name: Regenerate the SDK and verify every patch
         id: generate
         shell: bash
         run: |
           status=0
-          scripts/sdk-generate.sh --verify-each 2>&1 | tee generate.log || status=$?
+          python3 scripts/sdk-prepare.py --update-expected --verify-each 2>&1 | tee generate.log || status=$?
           {
-            echo "generated=$(git -C tuta-repo rev-parse HEAD)"
+            if [ "$status" -eq 0 ]; then
+              echo "generated=$(sed -n 's/^tree=//p' sdk/EXPECTED)"
+            else
+              echo "generated="
+            fi
             echo "message=$(tail -n 1 generate.log | tr -d '`' | cut -c 1-300)"
           } >> "$GITHUB_OUTPUT"
           {
@@ -145,11 +151,10 @@ jobs:
           fetch-depth: 0
           submodules: recursive
           persist-credentials: false
-      - name: Regenerate with Git and publish the verified candidate
+      - name: Prepare with Git and publish the verified bridge candidate
         id: candidate
         env:
           GH_TOKEN: ${{ secrets.SDK_BUMP_TOKEN }}
-          SDK_BUMP_TOKEN: ${{ secrets.SDK_BUMP_TOKEN }}
           BASE: ${{ needs.detect.outputs.base }}
           TAG: ${{ needs.detect.outputs.tag }}
           UPSTREAM_SHA: ${{ needs.detect.outputs.upstream }}
