@@ -199,11 +199,17 @@ impl BridgeHandle {
         // already holds then fails the start at once, with a message naming
         // it, instead of a full login (and a TOTP prompt) followed by a
         // teardown that logged nothing.
-        let imap_listener = match crate::net::bind_local("IMAP", config.imap_port).await {
+        let bind_ip = match config.bind_ip() {
+            Ok(ip) => ip,
+            Err(msg) => return Err(self.start_failed(msg).await),
+        };
+        let imap_listener = match crate::net::bind_service("IMAP", bind_ip, config.imap_port).await
+        {
             Ok(listener) => listener,
             Err(msg) => return Err(self.start_failed(msg).await),
         };
-        let smtp_listener = match crate::net::bind_local("SMTP", config.smtp_port).await {
+        let smtp_listener = match crate::net::bind_service("SMTP", bind_ip, config.smtp_port).await
+        {
             Ok(listener) => listener,
             Err(msg) => return Err(self.start_failed(msg).await),
         };
@@ -217,8 +223,11 @@ impl BridgeHandle {
         } else {
             None
         };
-        self.emit_log(&format!("IMAP listening on 127.0.0.1:{}", config.imap_port));
-        self.emit_log(&format!("SMTP listening on 127.0.0.1:{}", config.smtp_port));
+        self.emit_log(&format!("IMAP listening on {bind_ip}:{}", config.imap_port));
+        self.emit_log(&format!("SMTP listening on {bind_ip}:{}", config.smtp_port));
+        if !bind_ip.is_loopback() {
+            self.emit_log("Warning: listening beyond this machine; the bridge password is the only protection");
+        }
 
         self.emit_log(&format!("Authenticating as {}...", config.email));
         let session = match tuta::login_with_2fa(&config, password.as_deref(), totp_callback).await

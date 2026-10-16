@@ -77,8 +77,12 @@ async fn main() -> anyhow::Result<()> {
         tls::load_or_create_tls_acceptor().map_err(|e| anyhow::anyhow!("TLS setup failed: {e}"))?;
     info!("TLS initialized");
 
-    info!("IMAP will listen on 127.0.0.1:{}", cfg.imap_port);
-    info!("SMTP will listen on 127.0.0.1:{}", cfg.smtp_port);
+    let bind_ip = cfg.bind_ip().map_err(|e| anyhow::anyhow!("{e}"))?;
+    info!("IMAP will listen on {bind_ip}:{}", cfg.imap_port);
+    info!("SMTP will listen on {bind_ip}:{}", cfg.smtp_port);
+    if !bind_ip.is_loopback() {
+        warn!("Listening beyond this machine; the bridge password is the only protection");
+    }
 
     let session = login_session(&cfg).await?;
     info!("Logged in as {}", cfg.email);
@@ -217,6 +221,7 @@ async fn main() -> anyhow::Result<()> {
         shutdown_rx.clone(),
     ));
     let imap_handle = tokio::spawn(imap::serve(
+        bind_ip,
         cfg.imap_port,
         store.clone(),
         backend.clone(),
@@ -237,11 +242,17 @@ async fn main() -> anyhow::Result<()> {
         cfg.mcp_permission,
         shutdown_rx.clone(),
     ));
-    let smtp_handle = tokio::spawn(smtp::serve(cfg.smtp_port, backend.clone(), smtp_tls, pw));
+    let smtp_handle = tokio::spawn(smtp::serve(
+        bind_ip,
+        cfg.smtp_port,
+        backend.clone(),
+        smtp_tls,
+        pw,
+    ));
 
     info!("Bridge is running. Configure Thunderbird with:");
-    info!("  IMAP server: 127.0.0.1:{} (SSL/TLS)", cfg.imap_port);
-    info!("  SMTP server: 127.0.0.1:{} (SSL/TLS)", cfg.smtp_port);
+    info!("  IMAP server: {bind_ip}:{} (SSL/TLS)", cfg.imap_port);
+    info!("  SMTP server: {bind_ip}:{} (SSL/TLS)", cfg.smtp_port);
     info!("  Username: {}", cfg.email);
     info!("  Password: ******** (run 'tutabridge password' to view)");
     info!("  Accept the self-signed certificate when prompted");

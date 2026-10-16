@@ -1,0 +1,26 @@
+services:
+  tutabridge:
+    image: kurotamastr/tutabridge:latest
+    container_name: tutabridge
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    user: "1000:1000"
+    ports: # external/internal
+      - "xxxx:1143"
+      - "xxxx:1025"
+    volumes:
+      - /path/to/tutabridge/config:/config
+      - /path/to/unencrypted/mail:/backup
+      # Certificate for your mail hostname:
+      # - /path/to/certs/fullchain.pem:/config/tutabridge/cert.pem:ro
+      # - /path/to/certs/privkey.pem:/config/tutabridge/key.pem:ro
+      # You can mount certificate automatically renewed by an instance like NPM
+    networks:
+      <your external container network>:
+        aliases:
+          - <alias mapping to the bridge for internal use> # Takes priority over online DNS
+
+networks:
+  <your external container network>:
+    external: true

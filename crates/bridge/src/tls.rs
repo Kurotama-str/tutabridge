@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 
@@ -75,15 +75,11 @@ fn load_certs(
     Ok(certs)
 }
 
+/// The first private key in `pem`, in any of the usual encodings (PKCS#8,
+/// PKCS#1 RSA, SEC1 EC), so a certificate authority's key file works as is.
 fn load_key(pem: &str) -> Result<PrivateKeyDer<'static>, Box<dyn std::error::Error + Send + Sync>> {
     let mut reader = std::io::BufReader::new(pem.as_bytes());
-    let keys: Vec<PrivatePkcs8KeyDer<'static>> =
-        rustls_pemfile::pkcs8_private_keys(&mut reader).collect::<Result<Vec<_>, _>>()?;
-    let key = keys
-        .into_iter()
-        .next()
-        .ok_or("No private key found in PEM")?;
-    Ok(PrivateKeyDer::Pkcs8(key))
+    rustls_pemfile::private_key(&mut reader)?.ok_or_else(|| "No private key found in PEM".into())
 }
 
 #[cfg(test)]

@@ -6,7 +6,7 @@
 //! number of concurrent connections. This loop fixes both and is transport
 //! agnostic so it can be unit-tested without TLS.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,14 +28,23 @@ pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 /// and the port, and says what to do when another application holds it: the
 /// GUI shows it as the bridge status, the CLI prints it on exit.
 pub(crate) async fn bind_local(service: &str, port: u16) -> Result<TcpListener, String> {
-    TcpListener::bind(("127.0.0.1", port))
+    bind_service(service, IpAddr::from([127, 0, 0, 1]), port).await
+}
+
+/// [`bind_local`] on an address of the caller's choosing.
+pub(crate) async fn bind_service(
+    service: &str,
+    ip: IpAddr,
+    port: u16,
+) -> Result<TcpListener, String> {
+    TcpListener::bind((ip, port))
         .await
         .map_err(|e| match e.kind() {
             std::io::ErrorKind::AddrInUse => format!(
                 "{service} port {port} is already in use by another application; \
                  choose a different {service} port"
             ),
-            _ => format!("Cannot listen for {service} on 127.0.0.1:{port}: {e}"),
+            _ => format!("Cannot listen for {service} on {ip}:{port}: {e}"),
         })
 }
 

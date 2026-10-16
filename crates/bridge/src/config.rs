@@ -6,6 +6,11 @@ pub struct Config {
     pub email: String,
     pub imap_port: u16,
     pub smtp_port: u16,
+    /// Address the IMAP and SMTP servers listen on. Loopback by default; set
+    /// to `0.0.0.0` to serve other machines or containers. The
+    /// `TUTABRIDGE_BIND_ADDRESS` environment variable overrides it.
+    #[serde(default = "default_bind_address")]
+    pub bind_address: String,
     #[serde(default = "default_api_url")]
     pub api_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -53,6 +58,10 @@ impl McpPermission {
     }
 }
 
+fn default_bind_address() -> String {
+    "127.0.0.1".to_string()
+}
+
 fn default_sync_limit() -> usize {
     500
 }
@@ -70,6 +79,18 @@ fn default_auto_update() -> bool {
 }
 
 impl Config {
+    /// The address the IMAP and SMTP servers bind to: the
+    /// `TUTABRIDGE_BIND_ADDRESS` environment variable when set, else
+    /// `bind_address`.
+    pub fn bind_ip(&self) -> Result<std::net::IpAddr, String> {
+        let from_env = std::env::var("TUTABRIDGE_BIND_ADDRESS")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        let raw = from_env.as_deref().unwrap_or(&self.bind_address).trim();
+        raw.parse()
+            .map_err(|_| format!("Bind address \"{raw}\" is not a valid IP address"))
+    }
+
     /// The listening ports must be usable and distinct. Two services on one
     /// port make the second bind fail at start; port 0 makes the system pick
     /// a random port no mail client would ever find. The MCP port only counts
@@ -101,6 +122,7 @@ impl Default for Config {
             email: String::new(),
             imap_port: 1143,
             smtp_port: 1025,
+            bind_address: default_bind_address(),
             api_url: default_api_url(),
             bridge_password: None,
             sync_limit: default_sync_limit(),
@@ -111,10 +133,21 @@ impl Default for Config {
     }
 }
 
-fn data_dir() -> PathBuf {
+pub(crate) fn data_dir() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("tutabridge")
+}
+
+/// Whether the Tuta session is kept in a file in the config directory instead
+/// of the OS keychain. Meant for headless installs (containers) that have no
+/// keychain: set `TUTABRIDGE_SESSION_STORE=file`.
+pub fn session_store_is_file() -> bool {
+    std::env::var("TUTABRIDGE_SESSION_STORE").is_ok_and(|v| v.trim().eq_ignore_ascii_case("file"))
+}
+
+pub fn session_file_path() -> PathBuf {
+    data_dir().join("session.json")
 }
 
 pub fn config_path() -> PathBuf {
@@ -236,6 +269,26 @@ mod tests {
     }
 
     #[test]
+    fn the_default_bind_address_is_loopback() {
+        assert_eq!(
+            Config::default().bind_ip(),
+            Ok(std::net::IpAddr::from([127, 0, 0, 1]))
+        );
+    }
+
+    #[test]
+    fn an_invalid_bind_address_is_refused() {
+        let cfg = Config {
+            bind_address: "not-an-ip".to_string(),
+            ..Config::default()
+        };
+        assert_eq!(
+            cfg.bind_ip(),
+            Err("Bind address \"not-an-ip\" is not a valid IP address".to_string())
+        );
+    }
+
+    #[test]
     fn test_default_config() {
         let cfg = Config::default();
         assert_eq!(cfg.email, "");
@@ -298,6 +351,7 @@ smtp_port = 1025
             email: "roundtrip@tuta.com".to_string(),
             imap_port: 2143,
             smtp_port: 2025,
+            bind_address: "0.0.0.0".to_string(),
             api_url: "https://app.tuta.com".to_string(),
             bridge_password: None,
             sync_limit: 500,

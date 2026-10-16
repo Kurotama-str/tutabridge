@@ -5,6 +5,9 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWrite
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
+use std::net::IpAddr;
+
+use crate::auth_guard::{self, PeerGuard};
 use crate::mail::parser::parse_rfc2822;
 use crate::tuta::MailBackend;
 
@@ -141,12 +144,13 @@ fn redact_credentials<'a>(line: &'a str, step: &AuthStep) -> std::borrow::Cow<'a
 }
 
 pub async fn serve(
+    bind: IpAddr,
     port: u16,
     tuta: Arc<dyn MailBackend>,
     tls: TlsAcceptor,
     password_hash: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let listener = crate::net::bind_local("SMTP", port).await?;
+    let listener = crate::net::bind_service("SMTP", bind, port).await?;
     serve_listener(listener, tuta, tls, password_hash).await
 }
 
@@ -160,21 +164,33 @@ pub async fn serve_listener(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("SMTP server listening on {} (TLS)", listener.local_addr()?);
 
+    let guard = auth_guard::global();
     crate::net::accept_loop(
         listener,
         "SMTP",
         crate::net::MAX_CONNECTIONS,
-        move |stream, _addr| {
+        move |stream, addr| {
             let tuta = tuta.clone();
             let tls = tls.clone();
             let pw_hash = password_hash.clone();
+            let guard = guard.clone();
             async move {
+                if guard.is_blacklisted(addr.ip()) {
+                    debug!("SMTP connection from blacklisted {addr} dropped");
+                    return;
+                }
+                let peer = PeerGuard::new(guard, addr.ip(), "SMTP");
                 match tokio::time::timeout(crate::net::HANDSHAKE_TIMEOUT, tls.accept(stream)).await
                 {
                     Ok(Ok(tls_stream)) => {
-                        if let Err(e) =
-                            handle_connection(tls_stream, tuta, pw_hash, SmtpLimits::default())
-                                .await
+                        if let Err(e) = handle_connection_guarded(
+                            tls_stream,
+                            tuta,
+                            pw_hash,
+                            SmtpLimits::default(),
+                            Some(peer),
+                        )
+                        .await
                         {
                             error!("SMTP connection error: {}", e);
                         }
@@ -190,11 +206,43 @@ pub async fn serve_listener(
     Ok(())
 }
 
+#[cfg(test)]
 async fn handle_connection<S>(
     stream: S,
     tuta: Arc<dyn MailBackend>,
     password_hash: Option<String>,
     limits: SmtpLimits,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    handle_connection_guarded(stream, tuta, password_hash, limits, None).await
+}
+
+/// Runs `verify` (which checks a password and answers with the SMTP reply)
+/// unless the client is locked out, and counts the outcome against the client.
+fn guarded_auth(peer: &Option<PeerGuard>, verify: impl FnOnce() -> String) -> String {
+    let Some(peer) = peer else {
+        return verify();
+    };
+    if peer.retry_after_secs().is_some() {
+        return "454 4.7.0 Too many failed login attempts, try again later\r\n".to_string();
+    }
+    let response = verify();
+    if response.starts_with("235") {
+        peer.succeeded();
+    } else {
+        peer.failed();
+    }
+    response
+}
+
+async fn handle_connection_guarded<S>(
+    stream: S,
+    tuta: Arc<dyn MailBackend>,
+    password_hash: Option<String>,
+    limits: SmtpLimits,
+    peer: Option<PeerGuard>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -237,7 +285,7 @@ where
             let response = match auth_step {
                 AuthStep::WaitPlainData => {
                     auth_step = AuthStep::None;
-                    verify_smtp_plain_data(trimmed, &password_hash)
+                    guarded_auth(&peer, || verify_smtp_plain_data(trimmed, &password_hash))
                 }
                 AuthStep::WaitLoginUser => {
                     auth_step = AuthStep::WaitLoginPass;
@@ -250,7 +298,7 @@ where
                         .ok()
                         .and_then(|b| String::from_utf8(b).ok())
                         .unwrap_or_default();
-                    verify_smtp_password(&password, &password_hash)
+                    guarded_auth(&peer, || verify_smtp_password(&password, &password_hash))
                 }
                 AuthStep::None => unreachable!(),
             };
@@ -348,7 +396,7 @@ where
                 let response = match auth_type.as_str() {
                     "PLAIN" => {
                         if let Some(data) = parts.get(2) {
-                            verify_smtp_plain_data(data, &password_hash)
+                            guarded_auth(&peer, || verify_smtp_plain_data(data, &password_hash))
                         } else {
                             auth_step = AuthStep::WaitPlainData;
                             "334 \r\n".to_string()

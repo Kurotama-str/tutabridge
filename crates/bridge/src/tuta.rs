@@ -1323,15 +1323,27 @@ fn save_credentials(email: &str, creds: &tutasdk::login::Credentials) {
         },
     });
 
-    match keyring::Entry::new(KEYRING_SERVICE, email) {
-        Ok(entry) => {
-            if let Err(e) = entry.set_password(&data.to_string()) {
-                log::warn!("Failed to save session to keychain: {e}");
-            } else {
-                log::info!("Session saved to keychain");
-            }
+    if crate::config::session_store_is_file() {
+        let path = crate::config::session_file_path();
+        let written = path
+            .parent()
+            .map_or(Ok(()), crate::fs_private::create_dir_all_private)
+            .and_then(|_| crate::fs_private::write_private(&path, data.to_string()));
+        match written {
+            Ok(()) => log::info!("Session saved to {}", path.display()),
+            Err(e) => log::warn!("Failed to save session to {}: {e}", path.display()),
         }
-        Err(e) => log::warn!("Failed to create keychain entry: {e}"),
+    } else {
+        match keyring::Entry::new(KEYRING_SERVICE, email) {
+            Ok(entry) => {
+                if let Err(e) = entry.set_password(&data.to_string()) {
+                    log::warn!("Failed to save session to keychain: {e}");
+                } else {
+                    log::info!("Session saved to keychain");
+                }
+            }
+            Err(e) => log::warn!("Failed to create keychain entry: {e}"),
+        }
     }
     *CREDENTIALS_CACHE.lock().unwrap() = Some(Some(creds.clone()));
 }
@@ -1348,11 +1360,20 @@ fn load_credentials(email: &str) -> Option<tutasdk::login::Credentials> {
 }
 
 fn load_credentials_from_keyring(email: &str) -> Option<tutasdk::login::Credentials> {
+    if crate::config::session_store_is_file() {
+        let path = crate::config::session_file_path();
+        crate::fs_private::tighten(&path);
+        let creds = credentials_from_json(&std::fs::read_to_string(path).ok()?)?;
+        // The file is not keyed by address the way a keychain entry is, so a
+        // session saved for another account must not be resumed.
+        return creds.login.eq_ignore_ascii_case(email).then_some(creds);
+    }
     let entry = keyring::Entry::new(KEYRING_SERVICE, email).ok()?;
+    credentials_from_json(&entry.get_password().ok()?)
+}
 
-    let json_str = entry.get_password().ok()?;
-
-    let v: serde_json::Value = serde_json::from_str(&json_str).ok()?;
+fn credentials_from_json(json_str: &str) -> Option<tutasdk::login::Credentials> {
+    let v: serde_json::Value = serde_json::from_str(json_str).ok()?;
     Some(tutasdk::login::Credentials {
         login: v["login"].as_str()?.to_string(),
         user_id: tutasdk::GeneratedId(v["user_id"].as_str()?.to_string()),
@@ -1375,11 +1396,23 @@ fn load_credentials_from_keyring(email: &str) -> Option<tutasdk::login::Credenti
 /// is never read back and retried. A leftover entry is overwritten by the
 /// next successful login.
 fn delete_credentials(email: &str) {
-    match keyring::Entry::new(KEYRING_SERVICE, email).and_then(|e| e.delete_credential()) {
-        Ok(()) | Err(keyring::Error::NoEntry) => {}
-        Err(e) => log::warn!(
-            "Could not remove the stale session from the keyring ({e}); it will be replaced on the next login"
-        ),
+    if crate::config::session_store_is_file() {
+        let path = crate::config::session_file_path();
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::warn!(
+                "Could not remove the stale session file {} ({e}); it will be replaced on the next login",
+                path.display()
+            ),
+        }
+    } else {
+        match keyring::Entry::new(KEYRING_SERVICE, email).and_then(|e| e.delete_credential()) {
+            Ok(()) | Err(keyring::Error::NoEntry) => {}
+            Err(e) => log::warn!(
+                "Could not remove the stale session from the keyring ({e}); it will be replaced on the next login"
+            ),
+        }
     }
     *CREDENTIALS_CACHE.lock().unwrap() = Some(None);
 }

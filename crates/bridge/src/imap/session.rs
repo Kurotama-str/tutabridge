@@ -2,6 +2,7 @@ use log::{debug, info};
 use std::sync::Arc;
 use tutasdk::entities::generated::tutanota::{Mail, MailAddress, TutanotaFile};
 
+use crate::auth_guard::PeerGuard;
 use crate::imap::search::{self, MsgView};
 use crate::mail::mail_to_rfc2822;
 use crate::mail::parser::{parse_address_headers, AddressHeaders};
@@ -46,6 +47,9 @@ pub struct ImapSession {
     idle_tag: Option<String>,
     auth_tag: Option<String>,
     password_hash: Option<String>,
+    /// Failed-login accounting for this connection's client. `None` in unit
+    /// tests, which have no client behind the session.
+    peer_guard: Option<PeerGuard>,
     /// Log-correlation id for the connection this session belongs to (see
     /// `imap::SESSION_COUNTER`). `0` in unit tests, which construct a session
     /// with no connection behind it.
@@ -70,7 +74,36 @@ impl ImapSession {
             idle_tag: None,
             auth_tag: None,
             password_hash,
+            peer_guard: None,
             session_id: 0,
+        }
+    }
+
+    /// Counts this session's failed logins against its client, and refuses
+    /// logins while that client is locked out.
+    pub(crate) fn with_peer_guard(mut self, peer_guard: PeerGuard) -> Self {
+        self.peer_guard = Some(peer_guard);
+        self
+    }
+
+    /// The refusal to send instead of checking the password, while the client
+    /// is locked out for too many failed logins.
+    fn lockout_response(&self, tag: &str) -> Option<Vec<String>> {
+        let wait = self.peer_guard.as_ref()?.retry_after_secs()?;
+        Some(vec![format!(
+            "{tag} NO [UNAVAILABLE] Too many failed login attempts, retry in {wait} seconds\r\n"
+        )])
+    }
+
+    fn login_failed(&self) {
+        if let Some(peer) = &self.peer_guard {
+            peer.failed();
+        }
+    }
+
+    fn login_succeeded(&self) {
+        if let Some(peer) = &self.peer_guard {
+            peer.succeeded();
         }
     }
 
@@ -129,12 +162,17 @@ impl ImapSession {
         };
 
         if let Some(ref expected) = self.password_hash {
+            if let Some(refusal) = self.lockout_response(&tag) {
+                return refusal;
+            }
             if password != *expected {
+                self.login_failed();
                 return vec![format!(
                     "{} NO [AUTHENTICATIONFAILED] Invalid credentials\r\n",
                     tag
                 )];
             }
+            self.login_succeeded();
         }
 
         self.state = State::Authenticated;
@@ -286,13 +324,18 @@ impl ImapSession {
 
     fn cmd_login(&mut self, tag: &str, args: &str) -> Vec<String> {
         if let Some(ref expected) = self.password_hash {
+            if let Some(refusal) = self.lockout_response(tag) {
+                return refusal;
+            }
             let (_, password) = parse_login_args(args);
             if password != *expected {
+                self.login_failed();
                 return vec![format!(
                     "{} NO [AUTHENTICATIONFAILED] Invalid credentials\r\n",
                     tag
                 )];
             }
+            self.login_succeeded();
         }
         self.state = State::Authenticated;
         info!(
@@ -3190,5 +3233,54 @@ mod tests {
             .handle_command(r#"A005 SEARCH TO "recip@test.com""#)
             .await;
         assert_eq!(resp[0], "* SEARCH 1 2\r\n");
+    }
+
+    #[tokio::test]
+    async fn repeated_wrong_passwords_lock_the_client_out() {
+        use crate::auth_guard::{AuthGuard, PeerGuard};
+
+        let store = MailStore::new();
+        let backend = Arc::new(MockBackend::with_mails(vec![]));
+        let peer = PeerGuard::new(
+            Arc::new(AuthGuard::in_memory()),
+            std::net::IpAddr::from([203, 0, 113, 1]),
+            "IMAP",
+        );
+        let mut session = ImapSession::new(store, backend, Some("right".to_string()), None)
+            .with_peer_guard(peer);
+
+        for i in 1..=4 {
+            let resp = session
+                .handle_command(&format!(r#"a{i} LOGIN "user" "wrong""#))
+                .await;
+            assert!(resp[0].contains("AUTHENTICATIONFAILED"), "attempt {i}");
+        }
+
+        // Locked out now: even the right password is refused unexamined.
+        let resp = session.handle_command(r#"a5 LOGIN "user" "right""#).await;
+        assert!(resp[0].contains("NO [UNAVAILABLE]"), "{}", resp[0]);
+    }
+
+    #[tokio::test]
+    async fn a_right_password_clears_earlier_failures() {
+        use crate::auth_guard::{AuthGuard, PeerGuard};
+
+        let store = MailStore::new();
+        let backend = Arc::new(MockBackend::with_mails(vec![]));
+        let peer = PeerGuard::new(
+            Arc::new(AuthGuard::in_memory()),
+            std::net::IpAddr::from([203, 0, 113, 2]),
+            "IMAP",
+        );
+        let mut session = ImapSession::new(store, backend, Some("right".to_string()), None)
+            .with_peer_guard(peer);
+
+        for i in 1..=3 {
+            session
+                .handle_command(&format!(r#"a{i} LOGIN "user" "wrong""#))
+                .await;
+        }
+        let resp = session.handle_command(r#"a4 LOGIN "user" "right""#).await;
+        assert!(resp[0].contains("OK LOGIN completed"), "{}", resp[0]);
     }
 }

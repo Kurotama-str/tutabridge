@@ -3,6 +3,7 @@ mod session;
 mod utf7;
 
 use log::{debug, error, info};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -10,6 +11,7 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 
+use crate::auth_guard::{self, PeerGuard};
 use crate::store::LocalStore;
 use crate::sync::MailStore;
 use crate::tuta::MailBackend;
@@ -22,6 +24,7 @@ use session::ImapSession;
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 pub async fn serve(
+    bind: IpAddr,
     port: u16,
     store: Arc<MailStore>,
     backend: Arc<dyn MailBackend>,
@@ -29,7 +32,7 @@ pub async fn serve(
     tls: TlsAcceptor,
     password_hash: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let listener = crate::net::bind_local("IMAP", port).await?;
+    let listener = crate::net::bind_service("IMAP", bind, port).await?;
     serve_listener(listener, store, backend, local_store, tls, password_hash).await
 }
 
@@ -45,6 +48,7 @@ pub async fn serve_listener(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("IMAP server listening on {} (TLS)", listener.local_addr()?);
 
+    let guard = auth_guard::global();
     crate::net::accept_loop(
         listener,
         "IMAP",
@@ -55,7 +59,13 @@ pub async fn serve_listener(
             let local_store = local_store.clone();
             let tls = tls.clone();
             let pw_hash = password_hash.clone();
+            let guard = guard.clone();
             async move {
+                if guard.is_blacklisted(addr.ip()) {
+                    debug!("IMAP connection from blacklisted {addr} dropped");
+                    return;
+                }
+                let peer = PeerGuard::new(guard, addr.ip(), "IMAP");
                 let session_id = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
                 match tokio::time::timeout(crate::net::HANDSHAKE_TIMEOUT, tls.accept(stream)).await
                 {
@@ -68,6 +78,7 @@ pub async fn serve_listener(
                             backend,
                             local_store,
                             pw_hash,
+                            peer,
                         )
                         .await
                         {
@@ -120,12 +131,14 @@ async fn handle_connection(
     backend: Arc<dyn MailBackend>,
     local_store: Arc<LocalStore>,
     password_hash: Option<String>,
+    peer: PeerGuard,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
     let mut store_watch: watch::Receiver<u64> = store.subscribe();
     let mut session = ImapSession::new(store, backend, password_hash, Some(local_store))
-        .with_session_id(session_id);
+        .with_session_id(session_id)
+        .with_peer_guard(peer);
 
     writer
         .write_all(b"* OK TutaBridge IMAP4rev1 ready\r\n")

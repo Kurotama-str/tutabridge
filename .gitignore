@@ -2,5 +2,5 @@
 /ui/node_modules
 /ui/dist
 .DS_Store
-
+dry-run/
 __pycache__/
