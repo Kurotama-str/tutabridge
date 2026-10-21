@@ -323,31 +323,34 @@ fn decode_header_value(s: &str) -> String {
         result.push_str(&remaining[..start]);
         remaining = &remaining[start + 2..];
 
+        // `charset?enc?text?=`: the text holds no `?` (RFC 2047), so the word
+        // ends right after it. Searching for the first `?=` from the start
+        // stopped at the `Q?=` of a Q word whose text begins with an escape
+        // (`=?UTF-8?Q?=C3=89t=C3=A9?=`) and kept the rest of the word as raw text.
         let parts: Vec<&str> = remaining.splitn(4, '?').collect();
-        if parts.len() >= 3 {
+        if parts.len() == 4 && parts[3].starts_with('=') {
             let encoding = parts[1].to_uppercase();
             let encoded = parts[2];
-            if let Some(end_marker) = remaining.find("?=") {
-                let decoded = if encoding == "B" {
-                    base64::engine::general_purpose::STANDARD
-                        .decode(encoded)
-                        .ok()
-                        .and_then(|bytes| String::from_utf8(bytes).ok())
-                } else if encoding == "Q" {
-                    Some(decode_q_encoding(encoded))
-                } else {
-                    None
-                };
+            let end_marker = parts[0].len() + parts[1].len() + parts[2].len() + 2;
+            let decoded = if encoding == "B" {
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+            } else if encoding == "Q" {
+                Some(decode_q_encoding(encoded))
+            } else {
+                None
+            };
 
-                if let Some(text) = decoded {
-                    result.push_str(&text);
-                    remaining = &remaining[end_marker + 2..];
-                    let ws_stripped = remaining.trim_start();
-                    if ws_stripped.starts_with("=?") {
-                        remaining = ws_stripped;
-                    }
-                    continue;
+            if let Some(text) = decoded {
+                result.push_str(&text);
+                remaining = &remaining[end_marker + 2..];
+                let ws_stripped = remaining.trim_start();
+                if ws_stripped.starts_with("=?") {
+                    remaining = ws_stripped;
                 }
+                continue;
             }
         }
         result.push_str("=?");
@@ -974,6 +977,34 @@ mod tests {
         let s = "=?UTF-8?Q?Hello_=C3=A9?=";
         let result = decode_header_value(s);
         assert_eq!(result, "Hello \u{e9}");
+    }
+
+    #[test]
+    fn test_decode_q_word_starting_with_escape() {
+        let s = "=?UTF-8?Q?=C3=89t=C3=A9?=";
+        let result = decode_header_value(s);
+        assert_eq!(result, "\u{c9}t\u{e9}");
+    }
+
+    #[test]
+    fn test_decode_unterminated_word_stays_raw() {
+        assert_eq!(decode_header_value("a =?UTF-8?Q?abc"), "a =?UTF-8?Q?abc");
+        assert_eq!(
+            decode_header_value("a =?UTF-8?Q?abc? x"),
+            "a =?UTF-8?Q?abc? x"
+        );
+    }
+
+    #[test]
+    fn test_parse_folded_subject_with_q_word_starting_with_escape() {
+        // Python's email package (3.14) folds this subject so that the second
+        // word starts with an escape.
+        let raw = "From: a@x.com\r\nTo: b@y.com\r\nSubject: Re: Ponuda za =?utf-8?q?odr=C5=BEavanje_=E2=80=93_Nikola_Nikoli?=\r\n =?utf-8?q?=C4=87?=\r\n\r\nbody\r\n";
+        let msg = parse_rfc2822(raw);
+        assert_eq!(
+            msg.subject,
+            "Re: Ponuda za odr\u{17e}avanje \u{2013} Nikola Nikoli\u{107}"
+        );
     }
 
     // --- quoted-printable soft break ---
