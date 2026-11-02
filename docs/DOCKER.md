@@ -41,6 +41,9 @@ in `data/tutabridge/config.toml` and restart.
 | Session in a file | `TUTABRIDGE_SESSION_STORE=file` | OS keychain (the image sets `file`) |
 | Ports | `imap_port` / `smtp_port` in `config.toml` | 1143 / 1025 |
 
+`TUTABRIDGE_SESSION_STORE=file` takes precedence over `pass_path`: in the image
+the session always lives in `session.json`, and `pass_path` has no effect.
+
 Published ports (`ports:` in `docker-compose.yml`) decide who can reach the
 bridge from outside the container. The MCP server always stays on loopback.
 
