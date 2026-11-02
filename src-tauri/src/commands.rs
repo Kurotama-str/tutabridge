@@ -27,9 +27,8 @@ pub async fn get_config() -> Result<Config, String> {
 }
 
 #[tauri::command]
-pub async fn save_config(config: Config) -> Result<(), String> {
-    config.validate_ports()?;
-    config::save_config(&config).map_err(|e| format!("Failed to save config: {e}"))
+pub async fn save_config(config: config::EditableSettings) -> Result<Config, String> {
+    config::save_settings(&config).map_err(|e| format!("Failed to save config: {e}"))
 }
 
 #[tauri::command]
@@ -38,7 +37,7 @@ pub async fn has_saved_session() -> Result<bool, String> {
         Ok(Some(cfg)) if !cfg.email.is_empty() => cfg,
         _ => return Ok(false),
     };
-    Ok(tuta::has_saved_session(&cfg.email))
+    tuta::has_saved_session(&cfg).map_err(|e| e.to_string())
 }
 
 /// Holds the sender side of the channel the 2FA callback blocks on. `submit_totp`
