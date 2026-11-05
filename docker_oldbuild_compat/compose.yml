@@ -1,4 +1,4 @@
-# Runs the new image (13/Dockerfile) on an EXISTING installation: same config
+# Runs the new image (13/Dockerfile) on an EXISTING installation from before 05-11-2026: same config
 # directory mount, same UID, same session.json, no new login. Replace the
 # placeholders with the values from your current compose file.
 services:
