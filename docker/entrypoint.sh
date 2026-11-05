@@ -59,7 +59,7 @@ prepare_store() {
 
 command=${1:-run}
 case "$command" in
-    --version|-V|version|--help|-h|help|password)
+    --version|-V|version|--help|-h|help|password|hash-password)
         exec tutabridge "$@"
         ;;
     init|run)

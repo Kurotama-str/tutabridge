@@ -206,6 +206,8 @@ class DockerEntrypointTests(unittest.TestCase):
 
     def test_help_and_unknown_commands_do_not_touch_volume(self):
         self.assert_ok(self.run_entrypoint("--version"))
+        self.assert_ok(self.run_entrypoint("hash-password"))
+        self.assertEqual(self.calls("tutabridge")[-1], ["hash-password"])
         self.assertFalse(self.data.exists())
         result = self.run_entrypoint("typo")
         self.assertNotEqual(result.returncode, 0)
