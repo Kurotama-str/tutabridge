@@ -257,7 +257,9 @@ graphical pinentry. Log in once after setting it; an existing keychain session
 is not moved.
 
 `TUTABRIDGE_SESSION_STORE=file` (set by the Docker image) takes precedence: the
-session is then kept in `session.json` and `pass_path` is ignored.
+session is then kept in `session.json` and `pass_path` is ignored. The file can be
+encrypted with a passphrase; see the [file session and Docker guide](docs/KUROTAMA_DOCKER.md)
+for that, for the `-compat` migration from older images, and for the risks of exposing the ports.
 
 ---
 

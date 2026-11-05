@@ -245,8 +245,9 @@ impl BridgeHandle {
         };
         self.emit_log(&format!("IMAP listening on {}", config.imap_addr()));
         self.emit_log(&format!("SMTP listening on {}", config.smtp_addr()));
-        if !config.imap_addr().ip().is_loopback() {
-            self.emit_log("Warning: listening beyond this machine; the bridge password is the only protection");
+        for (level, message) in config.security_notices() {
+            let label = if level == log::Level::Warn { "Warning" } else { "Note" };
+            self.emit_log(&format!("{label}: {message}"));
         }
 
         self.emit_log(&format!("Authenticating as {}...", config.email));

@@ -84,6 +84,31 @@ reading `session.json`, also under `run --non-interactive`.
 A wrong passphrase is retried with a growing delay. An encrypted session file
 that cannot be opened is never overwritten.
 
+## Exposing the ports
+
+Publishing the IMAP and SMTP ports beyond the host (a LAN, a reverse proxy, the
+internet) is done at your own risk. Whoever can reach them can try to log in,
+and the bridge password is the only protection. Mitigations, none of them a
+guarantee:
+
+* Publish only on the interfaces you need (`127.0.0.1:port:1143` rather than
+  `port:1143`), and filter with a firewall.
+* Use a long random bridge password, and store it hashed (below).
+* Keep the lockout and the blacklist in mind: they count the address the
+  bridge sees, see the next section.
+* Use a certificate your clients can verify (see Certificate) rather than the
+  self-signed one.
+* Encrypt the session file (`session_encryption_method`), since the bridge
+  holds a live Tuta session.
+
+At startup the bridge logs these notices:
+
+| Condition | Level |
+|---|---|
+| Listening on a non-loopback address (always the case inside a container, so look at what you publish) | warning |
+| `bridge_password` is plaintext while listening beyond loopback | warning, with the `hash-password` hint |
+| `session.json` is not encrypted (file store, method `none`) | info, a warning when listening beyond loopback |
+
 ## Failed logins, lockouts, blacklist
 
 Failed IMAP and SMTP logins are counted per client IP. The first three are free;

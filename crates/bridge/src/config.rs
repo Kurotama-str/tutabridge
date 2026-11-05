@@ -171,6 +171,47 @@ impl Config {
         }
     }
 
+    /// Security notices for startup, as `(level, message)`, shared by the CLI
+    /// and the desktop log. Call it once `bridge_password` has been generated.
+    pub fn security_notices(&self) -> Vec<(log::Level, String)> {
+        self.notices_for(!self.bind_ip().is_loopback(), session_store_is_file())
+    }
+
+    fn notices_for(&self, exposed: bool, file_store: bool) -> Vec<(log::Level, String)> {
+        let mut notices = Vec::new();
+        if exposed {
+            notices.push((
+                log::Level::Warn,
+                "Listening beyond this machine: the bridge password is the only protection, \
+                 and exposing these ports is at your own risk. In a container this address is \
+                 expected; what matters is where the ports are published."
+                    .to_owned(),
+            ));
+            let plaintext = self
+                .bridge_password
+                .as_deref()
+                .is_some_and(|password| !password.is_empty() && !crate::bridge_auth::is_hashed(password));
+            if plaintext {
+                notices.push((
+                    log::Level::Warn,
+                    "bridge_password is stored in plaintext in config.toml. Run \
+                     `tutabridge hash-password` and put the hash there; mail clients keep \
+                     using the plain password."
+                        .to_owned(),
+                ));
+            }
+        }
+        if file_store && self.session_encryption_method == SessionEncryptionMethod::None {
+            notices.push((
+                if exposed { log::Level::Warn } else { log::Level::Info },
+                "The saved session in session.json is not encrypted; set \
+                 session_encryption_method to `file` or `web` to protect it at rest."
+                    .to_owned(),
+            ));
+        }
+        notices
+    }
+
     pub fn imap_addr(&self) -> SocketAddr {
         SocketAddr::new(self.bind_ip(), self.imap_port)
     }
@@ -433,6 +474,37 @@ mod tests {
     fn the_older_bind_address_key_is_still_read() {
         let cfg = parse_config("email = \"a@b.c\"\nbind_address = \"0.0.0.0\"\n").unwrap();
         assert_eq!(cfg.bind_addr, IpAddr::from([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn exposure_notices_follow_the_bind_address_and_password_form() {
+        let plain = Config {
+            bridge_password: Some("secret".into()),
+            ..Config::default()
+        };
+        let hashed = Config {
+            bridge_password: Some("$argon2id$v=19$m=65536,t=3,p=4$c2FsdA$aGFzaA".into()),
+            ..Config::default()
+        };
+        assert!(plain.notices_for(false, false).is_empty());
+        assert_eq!(plain.notices_for(true, false).len(), 2);
+        assert_eq!(hashed.notices_for(true, false).len(), 1);
+        assert!(plain.notices_for(true, false)[1].1.contains("plaintext"));
+    }
+
+    #[test]
+    fn an_unencrypted_session_file_is_noted_and_escalates_when_exposed() {
+        let cfg = Config::default();
+        assert_eq!(cfg.notices_for(false, false).len(), 0);
+        let local = cfg.notices_for(false, true);
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0].0, log::Level::Info);
+        assert_eq!(cfg.notices_for(true, true).last().unwrap().0, log::Level::Warn);
+        let encrypted = Config {
+            session_encryption_method: SessionEncryptionMethod::Web,
+            ..Config::default()
+        };
+        assert!(encrypted.notices_for(false, true).is_empty());
     }
 
     #[test]

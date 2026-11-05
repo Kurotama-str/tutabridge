@@ -180,8 +180,8 @@ async fn serve_bridge(
 
     info!("IMAP will listen on {}", cfg.imap_addr());
     info!("SMTP will listen on {}", cfg.smtp_addr());
-    if !cfg.imap_addr().ip().is_loopback() {
-        warn!("Listening beyond this machine; the bridge password is the only protection");
+    for (level, message) in cfg.security_notices() {
+        log::log!(level, "{message}");
     }
     info!("Logged in as {}", cfg.email);
 
