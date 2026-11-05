@@ -472,7 +472,8 @@ mod tests {
 
     #[test]
     fn the_older_bind_address_key_is_still_read() {
-        let cfg = parse_config("email = \"a@b.c\"\nbind_address = \"0.0.0.0\"\n").unwrap();
+        let base = "email = \"test@tuta.com\"\nimap_port = 1143\nsmtp_port = 1025\n";
+        let cfg = parse_config(&format!("{base}bind_address = \"0.0.0.0\"\n")).unwrap();
         assert_eq!(cfg.bind_addr, IpAddr::from([0, 0, 0, 0]));
     }
 
