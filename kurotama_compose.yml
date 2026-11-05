@@ -1,0 +1,33 @@
+# Kurotama image (13/Dockerfile): file session store, optionally encrypted with
+# a passphrase (session_encryption_method in config.toml). Replace the
+# placeholders. Upstream's own compose file is compose.yaml.
+# First login: docker compose -f kurotama_compose.yml run --rm -it tutabridge
+services:
+  tutabridge:
+    image: kurotamastr/tutabridge:latest
+    container_name: tutabridge
+    restart: unless-stopped
+    stop_grace_period: 20s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    ports: # external:internal
+      - "xxxx:1143" # IMAP
+      - "xxxx:1025" # SMTP
+      - "xxxx:8080" # session unlock page (session_encryption_method = "web")
+    volumes:
+      - /path/to/tutabridge/data:/data # owned by UID 10001
+      - /path/to/mail/backup:/backup
+      # Certificate for your mail hostname, renewed by e.g. NPM. Restart the
+      # container after each renewal.
+      # - /path/to/certs/fullchain.pem:/data/config/tutabridge/cert.pem:ro
+      # - /path/to/certs/privkey.pem:/data/config/tutabridge/key.pem:ro
+    networks:
+      your_external_network:
+        aliases:
+          - your.mail.hostname # takes priority over online DNS
+
+networks:
+  your_external_network:
+    external: true

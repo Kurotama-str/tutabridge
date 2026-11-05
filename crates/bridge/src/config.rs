@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -6,11 +7,16 @@ pub struct Config {
     pub email: String,
     pub imap_port: u16,
     pub smtp_port: u16,
-    /// Address the IMAP and SMTP servers listen on. Loopback by default; set
-    /// to `0.0.0.0` to serve other machines or containers. The
-    /// `TUTABRIDGE_BIND_ADDRESS` environment variable overrides it.
-    #[serde(default = "default_bind_address")]
-    pub bind_address: String,
+    /// Address for the mail listeners only. MCP always remains on loopback.
+    /// Kept outside EditableSettings so desktop saves preserve manual values.
+    /// `bind_address` is the older spelling and is still read.
+    /// The `TUTABRIDGE_BIND_ADDRESS` environment variable overrides it.
+    #[serde(
+        default = "default_bind_addr",
+        alias = "bind_address",
+        skip_serializing_if = "is_default_bind_addr"
+    )]
+    pub bind_addr: IpAddr,
     #[serde(default = "default_api_url")]
     pub api_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -47,7 +53,7 @@ pub struct Config {
 
     /// Keep the login session in pass (password-store) as
     /// `<pass_path>/<email>` instead of the OS keyring. Unset means the
-    /// keyring.
+    /// keyring on supported desktop platforms; Android requires this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pass_path: Option<String>,
 }
@@ -108,12 +114,28 @@ impl McpPermission {
     }
 }
 
-fn default_bind_address() -> String {
-    "127.0.0.1".to_string()
+/// The `TUTABRIDGE_BIND_ADDRESS` override: `None` when unset or blank, an
+/// error message when it is not a valid IP address.
+fn bind_override(raw: Option<&str>) -> Result<Option<IpAddr>, String> {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(None),
+        Some(value) => value
+            .parse()
+            .map(Some)
+            .map_err(|_| format!("TUTABRIDGE_BIND_ADDRESS \"{value}\" is not a valid IP address")),
+    }
 }
 
 fn default_sync_limit() -> usize {
     500
+}
+
+fn default_bind_addr() -> IpAddr {
+    IpAddr::V4(Ipv4Addr::LOCALHOST)
+}
+
+fn is_default_bind_addr(address: &IpAddr) -> bool {
+    *address == default_bind_addr()
 }
 
 fn default_mcp_port() -> u16 {
@@ -134,15 +156,68 @@ fn default_auto_update() -> bool {
 
 impl Config {
     /// The address the IMAP and SMTP servers bind to: the
-    /// `TUTABRIDGE_BIND_ADDRESS` environment variable when set, else
-    /// `bind_address`.
-    pub fn bind_ip(&self) -> Result<std::net::IpAddr, String> {
-        let from_env = std::env::var("TUTABRIDGE_BIND_ADDRESS")
-            .ok()
-            .filter(|v| !v.trim().is_empty());
-        let raw = from_env.as_deref().unwrap_or(&self.bind_address).trim();
-        raw.parse()
-            .map_err(|_| format!("Bind address \"{raw}\" is not a valid IP address"))
+    /// `TUTABRIDGE_BIND_ADDRESS` environment variable when it holds a valid
+    /// IP address, else `bind_addr`.
+    pub fn bind_ip(&self) -> IpAddr {
+        static WARN_INVALID: std::sync::Once = std::sync::Once::new();
+        let raw = std::env::var("TUTABRIDGE_BIND_ADDRESS").ok();
+        match bind_override(raw.as_deref()) {
+            Ok(Some(ip)) => ip,
+            Ok(None) => self.bind_addr,
+            Err(message) => {
+                WARN_INVALID.call_once(|| log::warn!("{message}; using {}", self.bind_addr));
+                self.bind_addr
+            }
+        }
+    }
+
+    /// Security notices for startup, as `(level, message)`, shared by the CLI
+    /// and the desktop log. Call it once `bridge_password` has been generated.
+    pub fn security_notices(&self) -> Vec<(log::Level, String)> {
+        self.notices_for(!self.bind_ip().is_loopback(), session_store_is_file())
+    }
+
+    fn notices_for(&self, exposed: bool, file_store: bool) -> Vec<(log::Level, String)> {
+        let mut notices = Vec::new();
+        if exposed {
+            notices.push((
+                log::Level::Warn,
+                "Listening beyond this machine: the bridge password is the only protection, \
+                 and exposing these ports is at your own risk. In a container this address is \
+                 expected; what matters is where the ports are published."
+                    .to_owned(),
+            ));
+            let plaintext = self
+                .bridge_password
+                .as_deref()
+                .is_some_and(|password| !password.is_empty() && !crate::bridge_auth::is_hashed(password));
+            if plaintext {
+                notices.push((
+                    log::Level::Warn,
+                    "bridge_password is stored in plaintext in config.toml. Run \
+                     `tutabridge hash-password` and put the hash there; mail clients keep \
+                     using the plain password."
+                        .to_owned(),
+                ));
+            }
+        }
+        if file_store && self.session_encryption_method == SessionEncryptionMethod::None {
+            notices.push((
+                if exposed { log::Level::Warn } else { log::Level::Info },
+                "The saved session in session.json is not encrypted; set \
+                 session_encryption_method to `file` or `web` to protect it at rest."
+                    .to_owned(),
+            ));
+        }
+        notices
+    }
+
+    pub fn imap_addr(&self) -> SocketAddr {
+        SocketAddr::new(self.bind_ip(), self.imap_port)
+    }
+
+    pub fn smtp_addr(&self) -> SocketAddr {
+        SocketAddr::new(self.bind_ip(), self.smtp_port)
     }
 
     /// The listening ports must be usable and distinct. Two services on one
@@ -176,7 +251,7 @@ impl Default for Config {
             email: String::new(),
             imap_port: 1143,
             smtp_port: 1025,
-            bind_address: default_bind_address(),
+            bind_addr: default_bind_addr(),
             api_url: default_api_url(),
             bridge_password: None,
             sync_limit: default_sync_limit(),
@@ -372,22 +447,64 @@ mod tests {
 
     #[test]
     fn the_default_bind_address_is_loopback() {
+        assert_eq!(Config::default().bind_addr, IpAddr::from([127, 0, 0, 1]));
+    }
+
+    #[test]
+    fn the_bind_override_accepts_ips_and_ignores_blank_values() {
+        assert_eq!(bind_override(None), Ok(None));
+        assert_eq!(bind_override(Some("  ")), Ok(None));
         assert_eq!(
-            Config::default().bind_ip(),
-            Ok(std::net::IpAddr::from([127, 0, 0, 1]))
+            bind_override(Some(" 0.0.0.0 ")),
+            Ok(Some(IpAddr::from([0, 0, 0, 0])))
+        );
+        assert_eq!(
+            bind_override(Some("::")),
+            Ok(Some("::".parse::<IpAddr>().unwrap()))
         );
     }
 
     #[test]
-    fn an_invalid_bind_address_is_refused() {
-        let cfg = Config {
-            bind_address: "not-an-ip".to_string(),
+    fn an_invalid_bind_override_is_reported() {
+        assert!(bind_override(Some("not-an-ip")).is_err());
+        assert!(bind_override(Some("0.0.0.0:1143")).is_err());
+    }
+
+    #[test]
+    fn the_older_bind_address_key_is_still_read() {
+        let cfg = parse_config("email = \"a@b.c\"\nbind_address = \"0.0.0.0\"\n").unwrap();
+        assert_eq!(cfg.bind_addr, IpAddr::from([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn exposure_notices_follow_the_bind_address_and_password_form() {
+        let plain = Config {
+            bridge_password: Some("secret".into()),
             ..Config::default()
         };
-        assert_eq!(
-            cfg.bind_ip(),
-            Err("Bind address \"not-an-ip\" is not a valid IP address".to_string())
-        );
+        let hashed = Config {
+            bridge_password: Some("$argon2id$v=19$m=65536,t=3,p=4$c2FsdA$aGFzaA".into()),
+            ..Config::default()
+        };
+        assert!(plain.notices_for(false, false).is_empty());
+        assert_eq!(plain.notices_for(true, false).len(), 2);
+        assert_eq!(hashed.notices_for(true, false).len(), 1);
+        assert!(plain.notices_for(true, false)[1].1.contains("plaintext"));
+    }
+
+    #[test]
+    fn an_unencrypted_session_file_is_noted_and_escalates_when_exposed() {
+        let cfg = Config::default();
+        assert_eq!(cfg.notices_for(false, false).len(), 0);
+        let local = cfg.notices_for(false, true);
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0].0, log::Level::Info);
+        assert_eq!(cfg.notices_for(true, true).last().unwrap().0, log::Level::Warn);
+        let encrypted = Config {
+            session_encryption_method: SessionEncryptionMethod::Web,
+            ..Config::default()
+        };
+        assert!(encrypted.notices_for(false, true).is_empty());
     }
 
     #[test]
@@ -396,6 +513,9 @@ mod tests {
         assert_eq!(cfg.email, "");
         assert_eq!(cfg.imap_port, 1143);
         assert_eq!(cfg.smtp_port, 1025);
+        assert_eq!(cfg.bind_addr, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(cfg.imap_addr().to_string(), "127.0.0.1:1143");
+        assert_eq!(cfg.smtp_addr().to_string(), "127.0.0.1:1025");
         assert_eq!(cfg.api_url, "https://app.tuta.com");
     }
 
@@ -424,6 +544,48 @@ smtp_port = 1025
         let cfg = parse_config(toml).unwrap();
         assert_eq!(cfg.email, "test@tuta.com");
         assert_eq!(cfg.api_url, "https://app.tuta.com");
+        assert_eq!(cfg.bind_addr, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn mail_bind_address_accepts_ipv4_and_ipv6_literals() {
+        let base = "email = \"test@tuta.com\"\nimap_port = 1143\nsmtp_port = 1025\n";
+        for (ip, imap, smtp) in [
+            ("0.0.0.0", "0.0.0.0:1143", "0.0.0.0:1025"),
+            ("::1", "[::1]:1143", "[::1]:1025"),
+            ("::", "[::]:1143", "[::]:1025"),
+        ] {
+            let cfg = parse_config(&format!("{base}bind_addr = \"{ip}\"\n")).unwrap();
+            assert_eq!(cfg.imap_addr().to_string(), imap);
+            assert_eq!(cfg.smtp_addr().to_string(), smtp);
+            assert_eq!(cfg.validate_ports(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn mail_bind_address_serialization_omits_only_the_default() {
+        for ip in ["127.0.0.1", "0.0.0.0", "::1"] {
+            let cfg = Config {
+                bind_addr: ip.parse().unwrap(),
+                ..Config::default()
+            };
+            let serialized = toml::to_string_pretty(&cfg).unwrap();
+            let table: toml::Table = toml::from_str(&serialized).unwrap();
+            assert_eq!(table.contains_key("bind_addr"), ip != "127.0.0.1");
+            assert_eq!(parse_config(&serialized).unwrap(), cfg);
+        }
+    }
+
+    #[test]
+    fn mail_bind_address_rejects_hostnames_ports_and_invalid_values() {
+        let base = "email = \"test@tuta.com\"\nimap_port = 1143\nsmtp_port = 1025\n";
+        for value in ["localhost", "127.0.0.1:1143", "[::1]", "256.0.0.1", ""] {
+            assert!(
+                parse_config(&format!("{base}bind_addr = \"{value}\"\n")).is_err(),
+                "{value}"
+            );
+        }
+        assert!(parse_config(&format!("{base}bind_addr = 123\n")).is_err());
     }
 
     #[test]
@@ -453,7 +615,7 @@ smtp_port = 1025
             email: "roundtrip@tuta.com".to_string(),
             imap_port: 2143,
             smtp_port: 2025,
-            bind_address: "0.0.0.0".to_string(),
+            bind_addr: "::1".parse().unwrap(),
             api_url: "https://app.tuta.com".to_string(),
             bridge_password: None,
             sync_limit: 500,
@@ -572,6 +734,7 @@ mcp_port = 1944
 auto_update = true
 bridge_password = "keep-me"
 pass_path = "Tuta/Bridge"
+bind_addr = "0.0.0.0"
 [future_settings]
 enabled = true
 "#;
@@ -589,9 +752,11 @@ enabled = true
         assert_eq!(config.mcp_port, 2944);
         assert!(!config.auto_update);
         assert_eq!(config.bridge_password.as_deref(), Some("keep-me"));
+        assert_eq!(config.bind_addr, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         let merged: toml::Table = toml::from_str(&content).unwrap();
         assert_eq!(merged["bridge_password"].as_str(), Some("keep-me"));
         assert_eq!(merged["pass_path"].as_str(), Some("Tuta/Bridge"));
+        assert_eq!(merged["bind_addr"].as_str(), Some("0.0.0.0"));
         assert_eq!(merged["future_settings"]["enabled"].as_bool(), Some(true));
         assert_eq!(config, toml::from_str::<Config>(&content).unwrap());
     }
@@ -603,6 +768,7 @@ enabled = true
         assert_eq!(config.email, "me@tuta.io");
         assert_eq!(config.imap_port, 2143);
         assert_eq!(config.bridge_password, None);
+        assert_eq!(config.bind_addr, IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(config, toml::from_str::<Config>(&content).unwrap());
     }
 
@@ -641,6 +807,7 @@ enabled = true
         assert_eq!(saved.imap_port, 2143);
         let persisted: toml::Table = toml::from_str(&file.read()).unwrap();
         assert_eq!(persisted["pass_path"].as_str(), Some("Tuta/Bridge"));
+        assert_eq!(persisted["bind_addr"].as_str(), Some("0.0.0.0"));
         assert_eq!(saved, toml::from_str::<Config>(&file.read()).unwrap());
         #[cfg(unix)]
         {
@@ -678,6 +845,9 @@ enabled = true
         payload["bridge_password"] = serde_json::Value::String("stale-password".into());
         assert!(serde_json::from_value::<EditableSettings>(payload.clone()).is_err());
         payload.as_object_mut().unwrap().remove("bridge_password");
+        payload["bind_addr"] = serde_json::Value::String("0.0.0.0".into());
+        assert!(serde_json::from_value::<EditableSettings>(payload.clone()).is_err());
+        payload.as_object_mut().unwrap().remove("bind_addr");
         payload.as_object_mut().unwrap().remove("auto_update");
         assert!(serde_json::from_value::<EditableSettings>(payload).is_err());
     }

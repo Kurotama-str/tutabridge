@@ -115,6 +115,10 @@ releases.
 
 ## Getting started
 
+For an unattended CLI deployment, see the experimental [Docker guide](docs/DOCKER.md).
+It uses the existing `pass` backend, an interactive initialization command, and
+a persistent volume; normal container starts never prompt for credentials.
+
 The desktop app has a tray icon (the menu bar on macOS). Closing its window
 keeps the bridge running; use **Open TutaBridge** to bring it back or
 **Quit TutaBridge** to stop the app. Launching the app again also restores
@@ -253,7 +257,9 @@ graphical pinentry. Log in once after setting it; an existing keychain session
 is not moved.
 
 `TUTABRIDGE_SESSION_STORE=file` (set by the Docker image) takes precedence: the
-session is then kept in `session.json` and `pass_path` is ignored.
+session is then kept in `session.json` and `pass_path` is ignored. The file can be
+encrypted with a passphrase; see the [file session and Docker guide](docs/KUROTAMA_DOCKER.md)
+for that, for the `-compat` migration from older images, and for the risks of exposing the ports.
 
 ---
 

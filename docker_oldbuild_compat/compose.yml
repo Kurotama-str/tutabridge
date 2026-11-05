@@ -1,0 +1,35 @@
+# Runs the new image (13/Dockerfile) on an EXISTING installation from before 05-11-2026: same config
+# directory mount, same UID, same session.json, no new login. Replace the
+# placeholders with the values from your current compose file.
+services:
+  tutabridge:
+    image: kurotamastr/tutabridge:latest
+    container_name: tutabridge
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    user: "1000:1000" # the UID that owns your existing config directory
+    environment:
+      # The image defaults to /data; point everything back to the old /config.
+      TUTABRIDGE_DATA_DIR: /config
+      XDG_CONFIG_HOME: /config
+      XDG_CACHE_HOME: /config/cache
+      GNUPGHOME: /config/gnupg
+      PASSWORD_STORE_DIR: /config/pass
+    ports: # external:internal
+      - "xxxx:1143" # IMAP
+      - "xxxx:1025" # SMTP
+      - "xxxx:8080" # session unlock page (session_encryption_method = "web")
+    volumes:
+      - /path/to/tutabridge:/config
+      - /path/to/mail/backup:/backup
+      - /path/to/tutabridge/certs/fullchain.pem:/config/tutabridge/cert.pem:ro
+      - /path/to/tutabridge/certs/privkey.pem:/config/tutabridge/key.pem:ro
+    networks:
+      your_external_network:
+        aliases:
+          - your.mail.hostname
+
+networks:
+  your_external_network:
+    external: true

@@ -1,11 +1,10 @@
 use base64::Engine;
 use log::{debug, error, info};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
-
-use std::net::IpAddr;
 
 use crate::auth_guard::{self, PeerGuard};
 use crate::mail::parser::parse_rfc2822;
@@ -144,13 +143,12 @@ fn redact_credentials<'a>(line: &'a str, step: &AuthStep) -> std::borrow::Cow<'a
 }
 
 pub async fn serve(
-    bind: IpAddr,
-    port: u16,
+    address: SocketAddr,
     tuta: Arc<dyn MailBackend>,
     tls: TlsAcceptor,
     password_hash: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let listener = crate::net::bind_service("SMTP", bind, port).await?;
+    let listener = crate::net::bind("SMTP", address).await?;
     serve_listener(listener, tuta, tls, password_hash).await
 }
 

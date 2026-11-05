@@ -27,10 +27,11 @@ pub fn load_or_create_tls_acceptor() -> Result<TlsAcceptor, Box<dyn std::error::
         log::info!("Loading TLS certificate from {}", cert_file.display());
         // Heal installs whose key was written before it was created owner-only.
         crate::fs_private::tighten(&key_file);
-        (
-            std::fs::read_to_string(&cert_file)?,
-            std::fs::read_to_string(&key_file)?,
-        )
+        let cert_pem = std::fs::read_to_string(&cert_file)?;
+        let key_pem = std::fs::read_to_string(&key_file)?;
+        warn_if_blank(&cert_file, &cert_pem);
+        warn_if_blank(&key_file, &key_pem);
+        (cert_pem, key_pem)
     } else {
         log::info!("Generating self-signed TLS certificate...");
         let (cert, key) = generate_self_signed()?;
@@ -49,6 +50,23 @@ pub fn load_or_create_tls_acceptor() -> Result<TlsAcceptor, Box<dyn std::error::
         .with_single_cert(certs, key)?;
 
     Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+/// Warn about a certificate or key file that exists but holds nothing, as seen
+/// by the bridge itself. A file replaced by a bind mount is read with its mounted
+/// content, so an empty placeholder underneath a working mount never triggers
+/// this. The load below still fails; the warning says which file and why.
+fn warn_if_blank(path: &std::path::Path, content: &str) -> bool {
+    let blank = content.trim().is_empty();
+    if blank {
+        log::warn!(
+            "{} is empty, so TLS setup will fail. Fill it with the real PEM, or delete \
+             both cert.pem and key.pem to get a self-signed certificate. If it should \
+             be a bind mount, check that the mount is in place.",
+            path.display()
+        );
+    }
+    blank
 }
 
 fn generate_self_signed() -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
@@ -85,6 +103,14 @@ fn load_key(pem: &str) -> Result<PrivateKeyDer<'static>, Box<dyn std::error::Err
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_blank_files_are_reported_empty() {
+        let path = std::path::Path::new("cert.pem");
+        assert!(warn_if_blank(path, ""));
+        assert!(warn_if_blank(path, " \n\t\n"));
+        assert!(!warn_if_blank(path, "-----BEGIN CERTIFICATE-----"));
+    }
 
     #[test]
     fn test_tls_acceptor_builds() {
