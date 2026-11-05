@@ -197,25 +197,40 @@ changed by this step.
 Do this to end up on `/data` and UID 10001 like a new install, still with the
 file session. Each point is independent; stop at any of them.
 
-1. Stop the container and copy the directory: `cp -a /path/to/tutabridge /path/to/tutabridge.bak`.
-2. Move the data into the new layout. The old config directory is the
-   `tutabridge` folder inside your mount:
+In this section, `APPDIR` is the directory on the host that you mounted at
+`/config` in your old compose file, for example `/path/to/APPDIR`. The old
+image created a `tutabridge/` folder in it, holding `config.toml`,
+`session.json`, `store.db` and `mails/`.
+
+The new layout expects `APPDIR` mounted at `/data`, with the config folder at
+`APPDIR/config/tutabridge/`. So the only move is `APPDIR/tutabridge` to
+`APPDIR/config/tutabridge`. `APPDIR/cache` is already where the new layout wants
+it, and `certs/` can stay where it is.
+
+1. Stop the container and copy the directory: `cp -a /path/to/APPDIR /path/to/APPDIR.bak`.
+2. Move the config folder:
 
    ```bash
-   mkdir -p /path/to/data/config
-   mv /path/to/tutabridge/tutabridge /path/to/data/config/tutabridge
+   cd /path/to/APPDIR
+   mkdir config
+   mv tutabridge config/tutabridge
    ```
 
-   The `certs/` folder can stay where it is, since it is mounted separately.
-3. Change ownership, or keep UID 1000 with `user:` (the container then needs no
-   `chown`):
+   If you keep a symlink such as `config.toml -> tutabridge/config.toml` in
+   `APPDIR`, point it at `config/tutabridge/config.toml`.
+3. Change ownership of `APPDIR` (certificates inside it included), or keep UID
+   1000 with `user:` and skip this:
 
    ```bash
-   sudo chown -R 10001:10001 /path/to/data
+   sudo chown -R 10001:10001 /path/to/APPDIR
    ```
 
-4. Switch to the new-install compose file (`kurotama_compose.yml`): mount
-   `/path/to/data` at `/data`, mount the certificates at
+   Files outside `APPDIR` that the container uses must stay reachable by the new
+   user, for example the mail backup directory and certificates stored
+   elsewhere. An ACL avoids changing their owner:
+   `sudo setfacl -R -m u:10001:rwX /path/to/mail/backup`.
+4. Switch the compose file to the new layout (`kurotama_compose.yml`): mount
+   `APPDIR` at `/data`, the certificates at
    `/data/config/tutabridge/cert.pem` and `key.pem`, and drop `user:` and the
    `environment:` block. Keep the unlock page port if you use `web`.
 5. Optional hardening already in `kurotama_compose.yml`: `cap_drop: ALL`,
@@ -226,9 +241,23 @@ file session. Each point is independent; stop at any of them.
 7. Start, check the logs as in step 1, and keep the `.bak` copy until you are
    sure.
 
-To go back from step 2, stop the container, move
-`/path/to/data/config/tutabridge` back to `/path/to/tutabridge/tutabridge`,
-restore ownership with `chown -R 1000:1000`, and use the step 1 compose file.
+Result:
+
+```text
+APPDIR/                  mounted at /data
+  cache/
+  certs/                 yours, mounted separately into the container
+  config/tutabridge/     config.toml, session.json, store.db, mails/, ...
+```
+
+Without moving anything: mount `APPDIR` at `/data` and set
+`XDG_CONFIG_HOME: /data` in `environment:`. The bridge then reads
+`APPDIR/tutabridge/`, where the files already are. This keeps the `/data` mount
+and the new user, and differs from a stock layout only in the folder name.
+
+To go back from step 2, stop the container, run
+`mv config/tutabridge tutabridge` in `APPDIR`, restore ownership with
+`chown -R 1000:1000`, and use the step 1 compose file.
 
 ### Moving to upstream's `pass` storage
 
