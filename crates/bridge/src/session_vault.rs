@@ -208,9 +208,12 @@ async fn wait_for_file(cfg: &Config, hash: &str) -> Result<String, String> {
 }
 
 async fn wait_for_web(cfg: &Config, hash: &str) -> Result<String, String> {
-    let ip = cfg.bind_ip()?;
-    let listener =
-        crate::net::bind_service("Session unlock", ip, cfg.session_unlock_port).await?;
+    let ip = cfg.bind_ip();
+    let listener = crate::net::bind(
+        "Session unlock",
+        std::net::SocketAddr::new(ip, cfg.session_unlock_port),
+    )
+    .await?;
     let acceptor = crate::tls::load_or_create_tls_acceptor()
         .map_err(|e| format!("TLS setup for the unlock page failed: {e}"))?;
     log::info!(
