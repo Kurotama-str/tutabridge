@@ -98,8 +98,18 @@ pub async fn serve_listener(
                             crate::net::tls_failure_level(&e),
                             "IMAP session {session_id}: TLS failure ({addr}): {e}"
                         );
+                        if crate::net::is_not_a_tls_handshake(&e) {
+                            crate::net::hint_missing_tls(
+                                "IMAP",
+                                addr,
+                                "sent data that is not a TLS handshake",
+                            );
+                        }
                     }
-                    Err(_) => debug!("IMAP session {session_id}: TLS handshake timed out ({addr})"),
+                    Err(_) => {
+                        debug!("IMAP session {session_id}: TLS handshake timed out ({addr})");
+                        crate::net::hint_missing_tls("IMAP", addr, "connected but never started TLS");
+                    }
                 }
             }
         },

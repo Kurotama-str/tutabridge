@@ -6,9 +6,10 @@
 //! number of concurrent connections. This loop fixes both and is transport
 //! agnostic so it can be unit-tested without TLS.
 
-use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use log::{debug, error};
 use tokio::net::{TcpListener, TcpStream};
@@ -18,18 +19,65 @@ use tokio::sync::Semaphore;
 /// TLS/provider errors visible rather than lowering every handshake failure.
 pub(crate) fn tls_failure_level(error: &std::io::Error) -> log::Level {
     use tokio_rustls::rustls::Error;
-    if is_benign_disconnect(error) {
+    if is_benign_disconnect(error) || is_not_a_tls_handshake(error) {
         return log::Level::Debug;
     }
     match error.get_ref().and_then(|e| e.downcast_ref::<Error>()) {
-        Some(
-            Error::InvalidMessage(_)
-            | Error::InappropriateMessage { .. }
-            | Error::InappropriateHandshakeMessage { .. },
-        ) => log::Level::Debug,
         Some(Error::AlertReceived(_) | Error::PeerIncompatible(_)) => log::Level::Warn,
         _ => log::Level::Error,
     }
+}
+
+/// The first bytes were not a TLS handshake: what a client speaking plaintext
+/// (or STARTTLS) to a port that expects TLS from the first byte sends, and
+/// what port scanners send as well.
+pub(crate) fn is_not_a_tls_handshake(error: &std::io::Error) -> bool {
+    use tokio_rustls::rustls::Error;
+    matches!(
+        error.get_ref().and_then(|e| e.downcast_ref::<Error>()),
+        Some(
+            Error::InvalidMessage(_)
+                | Error::InappropriateMessage { .. }
+                | Error::InappropriateHandshakeMessage { .. }
+        )
+    )
+}
+
+/// How long an address is left alone after a hint about it was logged.
+const HINT_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// Addresses remembered at once. A flood of distinct addresses (a scan) fills
+/// the book and is then ignored rather than growing it.
+const HINT_MAX_ENTRIES: usize = 1024;
+
+static HINTED: OnceLock<Mutex<HashMap<IpAddr, Instant>>> = OnceLock::new();
+
+/// True the first time `ip` is seen within [`HINT_INTERVAL`], and records it.
+/// Expired entries are dropped on every call.
+fn should_hint_at(book: &mut HashMap<IpAddr, Instant>, ip: IpAddr, now: Instant) -> bool {
+    book.retain(|_, hinted| now.saturating_duration_since(*hinted) < HINT_INTERVAL);
+    if book.contains_key(&ip) || book.len() >= HINT_MAX_ENTRIES {
+        return false;
+    }
+    book.insert(ip, now);
+    true
+}
+
+/// A client reached a TLS port without starting TLS (`what` says how). That is
+/// almost always a mail client set to "no encryption" or STARTTLS, which fails
+/// silently on the client's side, so say so once per address and hour. At info
+/// level: debug is off by default, and a failed login would show up anyway.
+/// Independent of the login lockout and blacklist, which only count logins.
+pub(crate) fn hint_missing_tls(service: &str, addr: SocketAddr, what: &str) {
+    let ip = addr.ip().to_canonical();
+    let book = HINTED.get_or_init(Default::default);
+    if !should_hint_at(&mut crate::util::lock_recover(book), ip, Instant::now()) {
+        return;
+    }
+    log::info!(
+        "{service}: {ip} {what}. This port expects TLS from the first byte \
+         (implicit SSL/TLS, not STARTTLS or plaintext): check the client's \
+         security setting. Not repeated for this address for an hour."
+    );
 }
 
 /// Max concurrent client connections per server. Bounds file descriptors and
@@ -218,6 +266,43 @@ mod tests {
         ] {
             assert_eq!(tls_failure_level(&error), expected);
         }
+    }
+
+    #[test]
+    fn plaintext_and_garbage_handshakes_are_recognised_but_alerts_are_not() {
+        use std::io::{Error, ErrorKind};
+        use tokio_rustls::rustls::{self, AlertDescription, InvalidMessage};
+        assert!(is_not_a_tls_handshake(&Error::new(
+            ErrorKind::InvalidData,
+            rustls::Error::InvalidMessage(InvalidMessage::MessageTooShort),
+        )));
+        assert!(!is_not_a_tls_handshake(&Error::new(
+            ErrorKind::InvalidData,
+            rustls::Error::AlertReceived(AlertDescription::UnknownCA),
+        )));
+        assert!(!is_not_a_tls_handshake(&Error::from(ErrorKind::UnexpectedEof)));
+    }
+
+    #[test]
+    fn a_hint_is_given_once_per_address_per_hour_and_the_book_is_bounded() {
+        let (a, b): (IpAddr, IpAddr) = ("172.20.0.2".parse().unwrap(), "172.20.0.3".parse().unwrap());
+        let mut book = HashMap::new();
+        let start = Instant::now();
+        assert!(should_hint_at(&mut book, a, start));
+        assert!(!should_hint_at(&mut book, a, start + Duration::from_secs(30 * 60)));
+        assert!(should_hint_at(&mut book, b, start + Duration::from_secs(30 * 60)));
+        // An hour after the first hint, only `a` is due again.
+        assert!(should_hint_at(&mut book, a, start + HINT_INTERVAL));
+        assert!(!should_hint_at(&mut book, b, start + HINT_INTERVAL));
+        // A scan from many addresses cannot grow the book without bound.
+        let mut full = HashMap::new();
+        for n in 0..HINT_MAX_ENTRIES as u32 {
+            assert!(should_hint_at(&mut full, IpAddr::from(n.to_be_bytes()), start));
+        }
+        assert!(!should_hint_at(&mut full, a, start));
+        assert_eq!(full.len(), HINT_MAX_ENTRIES);
+        // Expired entries free the room again.
+        assert!(should_hint_at(&mut full, a, start + HINT_INTERVAL));
     }
 
     #[test]

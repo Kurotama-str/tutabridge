@@ -200,9 +200,22 @@ pub async fn serve_listener(
                         }
                     }
                     Ok(Err(e)) => {
-                        log::log!(crate::net::tls_failure_level(&e), "SMTP TLS failure: {e}");
+                        log::log!(
+                            crate::net::tls_failure_level(&e),
+                            "SMTP TLS failure ({addr}): {e}"
+                        );
+                        if crate::net::is_not_a_tls_handshake(&e) {
+                            crate::net::hint_missing_tls(
+                                "SMTP",
+                                addr,
+                                "sent data that is not a TLS handshake",
+                            );
+                        }
                     }
-                    Err(_) => debug!("SMTP TLS handshake timed out"),
+                    Err(_) => {
+                        debug!("SMTP TLS handshake timed out ({addr})");
+                        crate::net::hint_missing_tls("SMTP", addr, "connected but never started TLS");
+                    }
                 }
             }
         },
