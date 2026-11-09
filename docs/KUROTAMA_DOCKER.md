@@ -12,37 +12,74 @@ are untouched and describe the `pass` + GPG setup. Everything here is separate:
 | `docker_oldbuild_compat/compose.yml` | Compose file for an install that predates this image |
 | this file | Differences from upstream, settings, migration |
 
-The image uses upstream's entrypoint (`tini`, volume lock, `init` / `run`),
-with one difference: when `TUTABRIDGE_SESSION_STORE=file` (the image default)
-the GPG and `pass` checks are skipped. The Tuta session is kept in
-`session.json`, optionally encrypted with a passphrase.
+The image uses upstream's launcher and service supervisor (`tini`, then
+`entrypoint.sh`: no argument or `run` becomes `tutabridge run --wait`, anything
+else is passed through). The supervisor takes the volume lock, waits for a
+session, runs the bridge, retries after failures and answers `health`. The image
+sets `TUTABRIDGE_CONTAINER=1`, which turns it on. One difference: when
+`TUTABRIDGE_SESSION_STORE=file` (the image default) the GPG and `pass` setup is
+skipped. The Tuta session is kept in `session.json`, optionally encrypted with
+a passphrase.
+
+Images built from this fork are always `kurotamastr/tutabridge`.
 
 ## Build
 
 ```bash
-git submodule update --init tuta-repo
+cd /path/to/tutabridge-repo
+git submodule update --init --recursive
 python3 scripts/sdk-prepare.py
-docker build -f 13/Dockerfile -t kurotamastr/tutabridge:local .
+docker build -f 13/Dockerfile -t kurotamastr/tutabridge:dev .
+docker push kurotamastr/tutabridge:dev   # when you are ready to publish it
 ```
+
+`-f 13/Dockerfile` is needed because a plain `docker build .` uses upstream's
+`Dockerfile` at the root. `:dev` leaves `:latest` untouched.
 
 `--build-arg UID=1000` changes the default user baked into the image. The
 `user:` key of a compose file overrides it at run time as well.
 
 ## New install
 
-Copy `kurotama_compose.yml`, replace the placeholders, and make the data
-directory writable by the container user (10001 by default):
+In this document, `APPDIR` is the directory on the host that you mount at
+`/data` (the `/path/to/tutabridge/data` line in `kurotama_compose.yml`), for
+example `/path/to/APPDIR`. The app creates its own `config/tutabridge/` folder
+inside it; do not confuse that with `APPDIR` itself.
+
+Copy `kurotama_compose.yml`, replace the placeholders, and make `APPDIR`
+writable by the container user (10001 by default):
 
 ```bash
-mkdir -p /path/to/tutabridge/data && sudo chown 10001:10001 /path/to/tutabridge/data
-docker compose -f kurotama_compose.yml run --rm -it tutabridge init
+mkdir -p /path/to/APPDIR && sudo chown 10001:10001 /path/to/APPDIR
 docker compose -f kurotama_compose.yml up -d
+docker exec -it tutabridge init
+```
+
+Without Compose, the same with plain Docker:
+
+```bash
+docker run -d --name tutabridge --restart unless-stopped \
+  -p 127.0.0.1:1143:1143 -p 127.0.0.1:1025:1025 \
+  -v /path/to/APPDIR:/data kurotamastr/tutabridge:latest
+docker exec -it tutabridge init
 ```
 
 `init` asks for your Tuta address, password and TOTP code, saves the session and
 exits. `run` (the default command) never prompts: with no usable session it
-stops with a message asking you to run `init`. Stop the service before running
-`init`; both use the same volume lock.
+waits, reports itself unhealthy (see Health) and starts IMAP and SMTP within
+seconds after `init` completes. So you can start the container before the first
+login, and run `init` in it with `docker exec` while it waits.
+
+To log in before starting the service, run `init` in a throwaway container
+instead:
+
+```bash
+docker run --rm -it -v /path/to/APPDIR:/data kurotamastr/tutabridge:latest init
+```
+
+Both use the same volume lock, so do not run this while a service is serving
+from the same `APPDIR`; stop it first. `docker exec -it tutabridge password`
+prints the local bridge password.
 
 ## Layout
 
@@ -64,9 +101,10 @@ stops with a message asking you to run `init`. Stop the service before running
 | Bridge password | `bridge_password` in `config.toml`: plaintext, or an Argon2id hash | Generated, plaintext |
 
 A hashed value for `bridge_password` or `session_encryption_key` comes from
-`docker compose run --rm -it tutabridge hash-password`. Once the bridge password is
-hashed, `tutabridge password` can no longer show it: keep it in your mail client
-or password manager.
+`docker run --rm -it kurotamastr/tutabridge:latest hash-password` (it needs no
+volume), or `docker compose run --rm -it tutabridge hash-password`. Once the
+bridge password is hashed, `tutabridge password` can no longer show it and says
+so: keep it in your mail client or password manager.
 
 An invalid `TUTABRIDGE_BIND_ADDRESS` is ignored with a warning, and
 `bind_addr` is used instead.
@@ -83,6 +121,36 @@ reading `session.json`, also under `run --non-interactive`.
 
 A wrong passphrase is retried with a growing delay. An encrypted session file
 that cannot be opened is never overwritten.
+
+While it waits, the container logs where to unlock and reports itself unhealthy
+with a matching reason (see Health). After every restart this stays so until
+someone unlocks it.
+
+## Health
+
+The image declares a health check, `tutabridge health`. It opens a TLS
+connection to the IMAP and SMTP ports, pinned to the bridge's own certificate,
+and checks their greetings without logging in. Docker health has no values
+between healthy and unhealthy, so anything that stops the bridge from serving
+shows as unhealthy, with the reason as the check's output:
+
+```bash
+docker ps
+docker inspect --format '{{json .State.Health}}' tutabridge
+docker exec tutabridge tutabridge health
+```
+
+| Reason | What to do |
+|---|---|
+| Waiting for session unlock (web page on port N) | Open the unlock page and enter the passphrase. |
+| Waiting for session unlock (unlock file PATH) | Write the passphrase to that file. |
+| Waiting for configuration / for a saved session | Run `docker exec -it tutabridge init`. |
+| Saved session rejected | Tuta no longer accepts it (a password change, for example). Run `init` again; the old session is kept until a new login succeeds. |
+
+The other states (version rejected, Tuta unavailable, storage, volume occupied)
+are the same as upstream's, see the status table in `docs/DOCKER.md`. Docker
+shows `starting` during the first 30 s (the start period) before it reports
+healthy or unhealthy.
 
 ## Exposing the ports
 
@@ -180,10 +248,9 @@ Expect, in order: the unlock prompt if you use `web` or `file` encryption,
 
 What differs from the old image, even in this step:
 
-* `run` is non-interactive. If the session has expired, the container stops with
-  a message instead of prompting. Run
-  `docker compose stop && docker compose run --rm -it tutabridge init`, then
-  `docker compose up -d`.
+* `run` is non-interactive. If the session has expired, the container keeps
+  running, reports itself unhealthy and waits instead of prompting. Run
+  `docker exec -it tutabridge init`; it starts serving by itself within seconds.
 * Two new things appear in the config directory: `.lock` (volume lock) and
   `cache/` (the SDK cache, previously lost on recreation).
 * The container runs under `tini` and has 20 seconds' grace to stop if you set
@@ -197,9 +264,9 @@ changed by this step.
 Do this to end up on `/data` and UID 10001 like a new install, still with the
 file session. Each point is independent; stop at any of them.
 
-In this section, `APPDIR` is the directory on the host that you mounted at
-`/config` in your old compose file, for example `/path/to/APPDIR`. The old
-image created a `tutabridge/` folder in it, holding `config.toml`,
+In this section, `APPDIR` is, as above, a directory on the host, here the one
+you mounted at `/config` in your old compose file, for example
+`/path/to/APPDIR`. The old image created a `tutabridge/` folder in it, holding `config.toml`,
 `session.json`, `store.db` and `mails/`.
 
 The new layout expects `APPDIR` mounted at `/data`, with the config folder at
