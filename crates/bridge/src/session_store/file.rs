@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use super::codec;
+use super::{codec, SecretBytes};
 use crate::{config, fs_private, session_vault};
 
 pub(super) struct FileStore {
@@ -24,10 +24,10 @@ impl FileStore {
         self.path.display().to_string()
     }
 
-    pub(super) fn read(&self) -> Result<Option<Vec<u8>>, String> {
+    pub(super) fn read(&self) -> Result<Option<SecretBytes>, String> {
         fs_private::tighten(&self.path);
         let text = match std::fs::read_to_string(&self.path) {
-            Ok(text) => text,
+            Ok(text) => zeroize::Zeroizing::new(text),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(format!("cannot read {}: {e}", self.path.display())),
         };
@@ -39,10 +39,10 @@ impl FileStore {
                     self.path.display()
                 ));
             };
-            session_vault::decrypt(&passphrase, &text).map_err(|e| {
+            zeroize::Zeroizing::new(session_vault::decrypt(&passphrase, &text).map_err(|e| {
                 session_vault::block_writes();
                 format!("cannot decrypt {} ({e}); it is left untouched", self.path.display())
-            })?
+            })?)
         } else {
             // A plaintext file with encryption active: encrypt it now.
             if session_vault::active_passphrase().is_some() {
@@ -50,7 +50,7 @@ impl FileStore {
                     log::warn!("Could not encrypt the existing session file: {e}");
                 }
             }
-            text.into_bytes()
+            zeroize::Zeroizing::new(text.as_bytes().to_vec())
         };
         // The file is not keyed by address the way a keychain entry is, so a
         // session saved for another account must not be resumed.

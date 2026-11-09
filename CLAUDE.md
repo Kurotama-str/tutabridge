@@ -1,5 +1,7 @@
 # TutaBridge
 
+@AGENTS.md
+
 ## Architecture
 
 TutaBridge is an IMAP/SMTP bridge for Tuta encrypted email. It exposes a local IMAP+SMTP server that mail clients (Thunderbird, etc.) connect to.
@@ -77,3 +79,13 @@ the signed release workflow. Bridge-specific SDK extensions live in
 The GUI checks signed GitHub updates; users can disable automatic checks in
 settings. The CLI never updates itself. Keep the updater signing key and
 password backed up: installed apps trust the public key in tauri.conf.json.
+
+## Fork: merging upstream with rerere
+
+`git rerere` is enabled in this clone and replays earlier conflict resolutions
+(look for "Resolved '<file>' using previous resolution" during a merge). A
+replayed resolution is not a reviewed one: re-read each of those hunks, and
+check that the surrounding upstream code did not change in a way git cannot
+see (types, signatures, renamed helpers). Undo a wrong one with
+`git rerere forget <path>`. Keep the fork's auth, session-file and vault wiring
+intact whatever rerere replays.

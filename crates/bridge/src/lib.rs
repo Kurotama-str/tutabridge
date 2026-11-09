@@ -1,5 +1,4 @@
-mod auth_guard;
-pub mod bridge_auth;
+pub mod activity;
 pub mod backup;
 pub mod body_cache;
 pub mod bridge;
@@ -13,12 +12,16 @@ pub mod mcp;
 mod net;
 pub mod session_store;
 pub mod smtp;
-pub mod session_vault;
 pub mod store;
 pub mod sync;
 pub mod tls;
 pub mod tuta;
 pub mod util;
+
+// Kurotama fork modules, kept apart from upstream's list.
+mod auth_guard;
+pub mod bridge_auth;
+pub mod session_vault;
 
 /// The version people see: the release tag without its `v` when the release
 /// job sets `TUTABRIDGE_VERSION`, the crate version with a `-dev` suffix for

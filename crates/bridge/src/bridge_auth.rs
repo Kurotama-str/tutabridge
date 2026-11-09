@@ -15,7 +15,7 @@ pub fn is_hashed(configured: &str) -> bool {
 /// Whether `supplied` matches the configured bridge password.
 pub fn verify(supplied: &str, configured: &str) -> bool {
     if !is_hashed(configured) {
-        return supplied == configured;
+        return crate::util::secret_eq(supplied, configured);
     }
     match PasswordHash::new(configured) {
         Ok(parsed) => Argon2::default()

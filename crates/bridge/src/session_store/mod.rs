@@ -13,6 +13,9 @@ use crate::config::Config;
 use std::sync::{Arc, Mutex};
 use tutasdk::login::Credentials;
 
+/// Raw session bytes read from a backend, wiped when dropped.
+pub(crate) type SecretBytes = zeroize::Zeroizing<Vec<u8>>;
+
 const KEYRING_SUPPORTED: bool = cfg!(any(
     target_os = "macos",
     target_os = "windows",
@@ -496,7 +499,7 @@ impl Backend {
         }
     }
 
-    fn read(&mut self) -> Result<Option<Vec<u8>>, SessionStoreError> {
+    fn read(&mut self) -> Result<Option<SecretBytes>, SessionStoreError> {
         match self {
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             Self::Keyring { email } => keyring::read(email),
@@ -511,7 +514,9 @@ impl Backend {
                 message,
             }),
             #[cfg(test)]
-            Self::Fake(backend) => backend.read().map(|raw| raw.map(String::into_bytes)),
+            Self::Fake(backend) => backend
+                .read()
+                .map(|raw| raw.map(|raw| zeroize::Zeroizing::new(raw.into_bytes()))),
         }
     }
 
