@@ -112,6 +112,8 @@ struct Status {
     certificate: Option<String>,
     address: Option<std::net::IpAddr>,
     password: Option<String>,
+    /// What the running worker is waiting for (session unlock), shown by `health`.
+    note: Option<String>,
 }
 impl Status {
     fn waiting(state: State) -> Self {
@@ -121,8 +123,28 @@ impl Status {
             certificate: None,
             address: None,
             password: None,
+            note: None,
         }
     }
+}
+
+fn note_path() -> PathBuf {
+    runtime_dir().join("wait-note")
+}
+
+/// The worker tells the supervisor what it is blocked on, so `health` can say
+/// so. The file lives in the private runtime directory and holds no secret.
+pub fn set_wait_note(note: Option<&str>) {
+    let _ = match note {
+        Some(text) => std::fs::write(note_path(), text),
+        None => std::fs::remove_file(note_path()),
+    };
+}
+
+fn read_wait_note() -> Option<String> {
+    let text = std::fs::read_to_string(note_path()).ok()?;
+    let text: String = text.trim().chars().take(256).collect();
+    (!text.is_empty()).then_some(text)
 }
 struct StatusServer {
     _lock: Lock,
@@ -188,7 +210,8 @@ impl StatusServer {
                     serde_json::json!({"password":snapshot.password}).to_string()
                 } else if request == [b'h'] {
                     serde_json::json!({"state":snapshot.state as i32,"reason":snapshot.state.reason(),
-                    "ports":snapshot.ports,"certificate":snapshot.certificate,"address":snapshot.address}).to_string()
+                    "ports":snapshot.ports,"certificate":snapshot.certificate,"address":snapshot.address,
+                    "note":snapshot.note}).to_string()
                 } else {
                     continue;
                 };
@@ -211,6 +234,7 @@ impl StatusServer {
 fn configure_status() -> Status {
     // Called only while holding the data lock. Never load a session here.
     let mut status = Status::waiting(State::Starting);
+    status.note = read_wait_note();
     if let Ok(Some(cfg)) = tutabridge_core::config::load_config() {
         status.ports = Some((cfg.imap_port, cfg.smtp_port));
         status.address = Some(cfg.bind_addr);
@@ -383,6 +407,8 @@ async fn worker(
     stop: &mut watch::Receiver<bool>,
     status: &watch::Sender<Status>,
 ) -> anyhow::Result<Option<(i32, String)>> {
+    // A note left by an earlier worker must not outlive it.
+    set_wait_note(None);
     let prepared = (|| -> io::Result<_> {
         #[cfg(target_os = "linux")]
         if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
@@ -480,6 +506,7 @@ async fn worker(
         }
     };
     let result = terminate_group(&mut child, pid).await?;
+    set_wait_note(None);
     if stopped && !(init && result.success()) {
         return Ok(None);
     }
@@ -625,7 +652,8 @@ pub async fn supervise(
 }
 
 pub fn bootstrap(init: bool) -> Result<(), State> {
-    if !container() {
+    // The file session store needs neither GPG nor pass.
+    if !container() || tutabridge_core::config::session_store_is_file() {
         return Ok(());
     }
     let assets = std::env::var_os("TUTABRIDGE_ASSETS")
@@ -666,11 +694,20 @@ pub fn bootstrap(init: bool) -> Result<(), State> {
 
 /// Password is read by the volume owner, including when a bridge is running.
 pub async fn password() -> anyhow::Result<String> {
+    // An Argon2 hash is not the password: never print it as if it were.
+    fn shown(password: String) -> anyhow::Result<String> {
+        if tutabridge_core::bridge_auth::is_hashed(&password) {
+            bail!("The bridge password is stored as an Argon2 hash and cannot be shown");
+        }
+        Ok(password)
+    }
     if let Some(_lock) = Lock::acquire()? {
-        return tutabridge_core::config::load_config()
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .and_then(|cfg| cfg.bridge_password)
-            .context("No bridge password yet; run tutabridge init");
+        return shown(
+            tutabridge_core::config::load_config()
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .and_then(|cfg| cfg.bridge_password)
+                .context("No bridge password yet; run tutabridge init")?,
+        );
     }
     tokio::time::timeout(Duration::from_secs(1), async {
         let mut socket = UnixStream::connect(runtime_dir().join("health.sock"))
@@ -683,10 +720,12 @@ pub async fn password() -> anyhow::Result<String> {
             bail!("Invalid service response");
         }
         let response: serde_json::Value = serde_json::from_slice(&bytes)?;
-        response["password"]
-            .as_str()
-            .map(str::to_owned)
-            .context("Password unavailable during initialization")
+        shown(
+            response["password"]
+                .as_str()
+                .map(str::to_owned)
+                .context("Password unavailable during initialization")?,
+        )
     })
     .await
     .context("Password request timed out")?
@@ -734,6 +773,43 @@ mod tests {
         std::os::unix::fs::symlink("/dev/null", &path).unwrap();
         assert!(Lock::at(&path).is_err());
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// Restores the environment even when an assertion panics.
+    struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl EnvGuard {
+        fn new(keys: &[&'static str]) -> Self {
+            Self(keys.iter().map(|k| (*k, std::env::var_os(k))).collect())
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bootstrap_is_skipped_for_the_file_session_store_only() {
+        static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _serial = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = EnvGuard::new(&[
+            "TUTABRIDGE_CONTAINER",
+            "TUTABRIDGE_SESSION_STORE",
+            "TUTABRIDGE_ASSETS",
+        ]);
+        std::env::set_var("TUTABRIDGE_CONTAINER", "1");
+        // No bootstrap.sh here: reaching it is a failure.
+        std::env::set_var("TUTABRIDGE_ASSETS", "/nonexistent/tutabridge-assets");
+        std::env::set_var("TUTABRIDGE_SESSION_STORE", "file");
+        assert_eq!(bootstrap(true), Ok(()));
+        assert_eq!(bootstrap(false), Ok(()));
+        std::env::remove_var("TUTABRIDGE_SESSION_STORE");
+        assert_eq!(bootstrap(true), Err(State::Storage));
     }
 
     fn tls() -> (tokio_rustls::TlsAcceptor, String) {

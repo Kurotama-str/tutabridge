@@ -119,6 +119,34 @@ fn active_method(cfg: &Config) -> Option<(SessionEncryptionMethod, String)> {
     Some((cfg.session_encryption_method, key.to_string()))
 }
 
+/// What [`ensure_unlocked`] will wait for, e.g. "Waiting for session unlock
+/// (web page on port 8080)". `None` when it returns at once. Logs nothing.
+pub fn pending_unlock(cfg: &Config) -> Option<String> {
+    let key = cfg.session_encryption_key.trim();
+    if !config::session_store_is_file()
+        || cfg.session_encryption_method == SessionEncryptionMethod::None
+        || PASSPHRASE.lock().unwrap().is_some()
+        || !crate::bridge_auth::is_hashed(key)
+        || argon2::password_hash::PasswordHash::new(key).is_err()
+    {
+        return None;
+    }
+    Some(match cfg.session_encryption_method {
+        SessionEncryptionMethod::File => {
+            let path = cfg
+                .session_unlock_file
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(config::default_unlock_file_path);
+            format!("Waiting for session unlock (unlock file {})", path.display())
+        }
+        _ => format!(
+            "Waiting for session unlock (web page on port {})",
+            cfg.session_unlock_port
+        ),
+    })
+}
+
 /// Wait until the passphrase is known when encryption is active. Idempotent;
 /// returns at once when encryption is off or the session is in the keychain.
 pub async fn ensure_unlocked(cfg: &Config) -> Result<(), String> {

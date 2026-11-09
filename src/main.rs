@@ -194,6 +194,17 @@ async fn container_worker(init: bool) -> Result<(), service::State> {
     if cfg.email.trim().is_empty() || cfg.validate_ports().is_err() {
         return Err(State::Configuration);
     }
+    // An encrypted session file must be unlocked before it can be read. Say
+    // what is awaited so `health` shows it instead of a generic "starting".
+    if let Some(note) = tutabridge_core::session_vault::pending_unlock(&cfg) {
+        service::set_wait_note(Some(&note));
+    }
+    let unlocked = tutabridge_core::session_vault::ensure_unlocked(&cfg).await;
+    service::set_wait_note(None);
+    unlocked.map_err(|error| {
+        log::error!("Session unlock failed: {error}");
+        State::Storage
+    })?;
     let store = tutabridge_core::session_store::SessionStore::new(&cfg);
     if store
         .load_persisted(false)

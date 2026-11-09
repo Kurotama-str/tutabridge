@@ -51,6 +51,9 @@ pub async fn check() -> anyhow::Result<()> {
             bail!("Invalid service status");
         }
         let status: serde_json::Value = serde_json::from_slice(&bytes)?;
+        if let Some(note) = status["note"].as_str() {
+            bail!("{note}");
+        }
         let target = probe_target(&status)?;
         probe(target.address, target.imap, target.smtp, target.certificate).await
     })
