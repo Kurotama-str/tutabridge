@@ -35,15 +35,21 @@ FROM debian:trixie-slim AS runtime
 # Secret Service is needed. pass and gnupg serve the optional pass backend.
 ARG UID=10001
 RUN apt-get update && apt-get install --no-install-recommends -y \
-    ca-certificates pass gnupg libdbus-1-3 util-linux tini \
+    ca-certificates pass gnupg git libdbus-1-3 util-linux tini \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid ${UID} --create-home --shell /usr/sbin/nologin tutabridge \
     && install -d -m 0700 -o ${UID} -g ${UID} /data
 COPY --from=builder /build/tutabridge /usr/local/bin/tutabridge
-COPY --chmod=755 docker/entrypoint.sh /usr/local/lib/tutabridge/entrypoint.sh
+COPY --chmod=755 docker/entrypoint.sh docker/bootstrap.sh /usr/local/lib/tutabridge/
+# Shortcuts for docker exec: `init` and `password` run the same CLI commands.
+COPY --chmod=755 docker/bin/init docker/bin/password /usr/local/bin/
 COPY docker/config.toml docker/gpg-key-parameters /usr/local/lib/tutabridge/
 COPY LICENSE /usr/share/doc/tutabridge/LICENSE
-ENV TUTABRIDGE_DATA_DIR=/data \
+ENV HOME=/data \
+    TUTABRIDGE_CONTAINER=1 \
+    TUTABRIDGE_RUNTIME_DIR=/tmp/tutabridge \
+    PASSWORD_STORE_GPG_OPTS="--batch --pinentry-mode error" \
+    TUTABRIDGE_DATA_DIR=/data \
     XDG_CONFIG_HOME=/data/config \
     XDG_CACHE_HOME=/data/cache \
     GNUPGHOME=/data/gnupg \
@@ -53,6 +59,9 @@ ENV TUTABRIDGE_DATA_DIR=/data \
 USER ${UID}:${UID}
 VOLUME ["/data"]
 EXPOSE 1143 1025
+# Unhealthy also while waiting for a session unlock; the reason is shown by
+# `docker ps` and `docker inspect`.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 CMD ["tutabridge", "health"]
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/lib/tutabridge/entrypoint.sh"]
 CMD ["run"]

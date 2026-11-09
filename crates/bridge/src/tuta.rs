@@ -111,6 +111,12 @@ pub trait MailBackend: Send + Sync {
         target: &FolderInfo,
     ) -> Result<(), String>;
     async fn send_mail(&self, msg: &ParsedMessage) -> Result<(), String>;
+    /// Element id of a mail recently sent through this bridge, by the
+    /// Message-ID its client submitted. Lets IMAP answer the client's "save a
+    /// copy to Sent" with the UID of Tuta's own Sent copy.
+    async fn sent_mail_element_id(&self, _submitted_message_id: &str) -> Option<String> {
+        None
+    }
 }
 
 /// Canonical IMAP name for a system folder, or `None` for custom/unsupported.
@@ -181,11 +187,13 @@ const SENT_ID_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60
 /// long-running bridge stays bounded.
 const SENT_ID_CACHE_MAX_ENTRIES: usize = 200;
 
-/// One remembered send: when it happened and the Message-ID the server
-/// assigned to the delivered mail (bare, no angle brackets).
+/// One remembered send: when it happened, the Message-ID the server
+/// assigned to the delivered mail (bare, no angle brackets), and the element
+/// id of the sent mail, which keeps its draft's id when it moves to Sent.
 struct SentIdEntry {
     stored_at: std::time::Instant,
     tuta_message_id: String,
+    element_id: String,
 }
 
 pub struct TutaSession {
@@ -374,6 +382,16 @@ impl TutaSession {
         if mail.mailDetailsDraft.is_some() {
             match mail_facade.load_mail_details_draft(mail).await {
                 Ok(details) => Ok(Some(details)),
+                // A draft that was just sent or deleted loses its draft
+                // details; callers re-read the mail, so this is not a failure.
+                Err(
+                    e @ ApiCallError::ServerResponseError {
+                        source: tutasdk::rest_error::HttpError::NotFoundError,
+                    },
+                ) => {
+                    log::debug!("Draft details gone (sent or deleted): {e}");
+                    Err(e)
+                }
                 Err(e) => {
                     log::error!("Failed to load mail details draft: {e}");
                     Err(e)
@@ -697,6 +715,7 @@ impl TutaSession {
             base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .encode(randomizer.generate_random_array::<4>()),
         );
+        let draft_element_id = draft_return.draft.element_id.to_string();
         let send_data = build_send_draft_data(
             session_key.as_bytes().to_vec(),
             draft_return.draft,
@@ -714,7 +733,7 @@ impl TutaSession {
         // Remember submitted-id → delivered-id so the next patch in a
         // series can thread against what the server actually sent.
         if let Some(submitted_id) = &msg.message_id {
-            self.remember_sent_message_id(submitted_id, &send_return.messageId)
+            self.remember_sent_message_id(submitted_id, &send_return.messageId, &draft_element_id)
                 .await;
         }
         Ok(())
@@ -757,7 +776,7 @@ impl TutaSession {
     /// Remember which Message-ID the server assigned to a mail we just
     /// sent, keyed by the id the submitter used. Same soft-eviction shape
     /// as the self-send cache.
-    async fn remember_sent_message_id(&self, submitted_id: &str, tuta_id: &str) {
+    async fn remember_sent_message_id(&self, submitted_id: &str, tuta_id: &str, element_id: &str) {
         let mut cache = self.sent_id_cache.lock().await;
         if cache.len() >= SENT_ID_CACHE_MAX_ENTRIES && !cache.contains_key(submitted_id) {
             if let Some(oldest_key) = cache
@@ -773,6 +792,7 @@ impl TutaSession {
             SentIdEntry {
                 stored_at: std::time::Instant::now(),
                 tuta_message_id: tuta_id.to_string(),
+                element_id: element_id.to_string(),
             },
         );
     }
@@ -1112,6 +1132,14 @@ impl MailBackend for TutaSession {
     async fn send_mail(&self, msg: &ParsedMessage) -> Result<(), String> {
         self.send_mail_impl(msg).await.map_err(|e| format!("{e}"))
     }
+
+    async fn sent_mail_element_id(&self, submitted_message_id: &str) -> Option<String> {
+        let cache = self.sent_id_cache.lock().await;
+        cache
+            .get(submitted_message_id)
+            .filter(|e| e.stored_at.elapsed() <= SENT_ID_CACHE_TTL)
+            .map(|e| e.element_id.clone())
+    }
 }
 
 struct DiskFileClient {
@@ -1178,6 +1206,18 @@ pub async fn login_with_2fa(
 pub enum PersistencePolicy {
     AllowVolatile,
     Required,
+    /// Container resume/init keeps rejected bytes until a successful new login.
+    PreserveExistingRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ResumeError {
+    #[error("Saved session rejected; explicit initialization is required")]
+    SessionInvalid,
+    #[error("Tuta rejects this version; update the image")]
+    ClientRejected,
+    #[error("Tuta temporarily unavailable; saved session retained")]
+    Transient,
 }
 
 fn accept_session_save(
@@ -1185,7 +1225,9 @@ fn accept_session_save(
     result: Result<(), crate::session_store::SessionStoreError>,
 ) -> Result<(), crate::session_store::SessionStoreError> {
     match (policy, result) {
-        (PersistencePolicy::Required, result) => result,
+        (PersistencePolicy::Required | PersistencePolicy::PreserveExistingRequired, result) => {
+            result
+        }
         (_, Err(error)) => {
             log::warn!("Session is available only in memory: {error}");
             Ok(())
@@ -1205,6 +1247,10 @@ mod persistence_policy_tests {
             message: "encryption failed".into(),
         };
         assert!(accept_session_save(PersistencePolicy::Required, Err(failure())).is_err());
+        assert!(
+            accept_session_save(PersistencePolicy::PreserveExistingRequired, Err(failure()))
+                .is_err()
+        );
         assert!(accept_session_save(PersistencePolicy::AllowVolatile, Err(failure())).is_ok());
         for policy in [
             PersistencePolicy::Required,
@@ -1231,7 +1277,7 @@ pub async fn login_with_persistence(
     crate::session_vault::ensure_unlocked(cfg).await?;
     // Only an explicit password login may continue without persistence when
     // the OS keychain cannot be accessed. Automatic resume remains strict.
-    let credentials = if persistence == PersistencePolicy::Required {
+    let credentials = if persistence != PersistencePolicy::AllowVolatile {
         store.load_persisted(password.is_some()).await?
     } else if password.is_some() {
         store.load_interactive().await?
@@ -1249,7 +1295,11 @@ pub async fn login_with_persistence(
     let sdk = Sdk::new_without_suspension(cfg.api_url.clone(), rest_client, file_client);
 
     if let Some(credentials) = credentials {
-        log::info!("Resuming saved session...");
+        if persistence == PersistencePolicy::PreserveExistingRequired {
+            log::debug!("Resuming saved session...");
+        } else {
+            log::info!("Resuming saved session...");
+        }
         let access_token = credentials.access_token.clone();
         match sdk.login(credentials).await {
             Ok(logged_in) => {
@@ -1262,6 +1312,14 @@ pub async fn login_with_persistence(
                 });
             }
             Err(e) => match classify_resume_failure(&e) {
+                ResumeFailure::SessionInvalid
+                    if persistence == PersistencePolicy::PreserveExistingRequired =>
+                {
+                    if password.is_none() {
+                        return Err(ResumeError::SessionInvalid.into());
+                    }
+                    // Explicit reauthentication may replace it only after success.
+                }
                 ResumeFailure::SessionInvalid => {
                     log::warn!("Saved session is no longer valid, re-authenticating: {e}");
                     if let Err(error) = store.delete().await {
@@ -1269,6 +1327,9 @@ pub async fn login_with_persistence(
                     }
                 }
                 ResumeFailure::ClientRejected => {
+                    if persistence == PersistencePolicy::PreserveExistingRequired {
+                        return Err(ResumeError::ClientRejected.into());
+                    }
                     return Err(format!(
                         "Tuta rejects this version of the bridge ({e}); update the bridge. \
                          The saved session was kept."
@@ -1276,6 +1337,9 @@ pub async fn login_with_persistence(
                     .into());
                 }
                 ResumeFailure::Transient => {
+                    if persistence == PersistencePolicy::PreserveExistingRequired {
+                        return Err(ResumeError::Transient.into());
+                    }
                     return Err(format!(
                         "Could not resume the saved session ({e}); it was kept, try again later."
                     )
@@ -1349,7 +1413,12 @@ pub async fn login_with_persistence(
         Box::<dyn std::error::Error + Send + Sync>::from(format!("Login failed: {e}"))
     })?;
 
-    accept_session_save(persistence, store.save(&credentials).await)?;
+    let saved = if persistence == PersistencePolicy::PreserveExistingRequired {
+        store.save_preserving(&credentials).await
+    } else {
+        store.save(&credentials).await
+    };
+    accept_session_save(persistence, saved)?;
 
     Ok(TutaSession {
         logged_in,

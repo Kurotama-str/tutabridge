@@ -1,5 +1,5 @@
 use base64::Engine;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -190,10 +190,18 @@ pub async fn serve_listener(
                         )
                         .await
                         {
-                            error!("SMTP connection error: {}", e);
+                            if e.downcast_ref::<std::io::Error>()
+                                .is_some_and(crate::net::is_benign_disconnect)
+                            {
+                                debug!("SMTP peer disconnected");
+                            } else {
+                                error!("SMTP connection error: {}", e);
+                            }
                         }
                     }
-                    Ok(Err(e)) => error!("SMTP TLS handshake failed: {}", e),
+                    Ok(Err(e)) => {
+                        log::log!(crate::net::tls_failure_level(&e), "SMTP TLS failure: {e}");
+                    }
                     Err(_) => debug!("SMTP TLS handshake timed out"),
                 }
             }
@@ -376,6 +384,8 @@ where
             .to_uppercase();
 
         if !authenticated && matches!(cmd.as_str(), "MAIL" | "RCPT" | "DATA") {
+            // Usually a client set to "no authentication": say so in the log.
+            warn!("SMTP: {cmd} before authentication rejected; set the mail client's outgoing server to use password authentication");
             writer
                 .write_all(b"530 5.7.0 Authentication required\r\n")
                 .await?;
